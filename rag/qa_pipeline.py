@@ -549,24 +549,40 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
           definition, complications, comparison, treatment, diagnosis, timing,
           evidence, staging, risk_stratification, impact, surveillance,
           recurrence, molecular
+
+        SYNTHESIS MODE (relaxed null override):
+          The LLM is instructed to synthesise from available excerpts rather than
+          collapsing fields to null whenever excerpts are sparse. Every synthesised
+          claim must still carry a [SOURCE_X] tag so the user can trace it back.
+          Fields are set to null ONLY when no excerpt in the context addresses
+          that topic at all — not merely because the excerpt wording is imperfect.
         """
         base = f"""
 {self.instructions}
 
 You are a medical information assistant specialised in thyroid cancer.
-Answer using ONLY the tagged excerpts below. Do NOT use outside knowledge.
+Answer by SYNTHESISING the tagged excerpts below. Every factual claim must cite
+the excerpt(s) it came from using [SOURCE_X] tags.
 
 SOURCE TAGGING RULES:
-- Every factual claim must end with its source tag: "Fact. [SOURCE_1]"
-- Combine tags for multi-source claims: "Fact. [SOURCE_1][SOURCE_3]"
+- Every factual sentence must end with one or more source tags: "Fact. [SOURCE_1]"
+- Combine tags for multi-source synthesis: "Fact. [SOURCE_1][SOURCE_3]"
 - Never write a factual sentence without at least one [SOURCE_X] tag.
+- When you paraphrase or synthesise across excerpts, cite all contributing sources.
 
-STRICT SCHEMA CONTRACT:
-1. NEVER invent content. No data in context → set field to null.
-2. NEVER write placeholder text like "[Topic]", "[Drug Name]", "Name", "Type Name".
-3. ALL string values must be real sentences — not template examples.
-4. Missing sections: set content or items to null silently. Do NOT explain what is missing.
-5. Return ONLY valid JSON. No markdown fences, no preamble, no trailing text.
+SYNTHESIS CONTRACT:
+1. SYNTHESISE from the excerpts — combine, paraphrase, and infer where the excerpts
+   collectively support a claim. You do not need verbatim text; reasonable medical
+   synthesis from the excerpts is encouraged.
+2. Set a field to null ONLY if NO excerpt in the context addresses that topic at all.
+   Do not set fields to null simply because the phrasing in the excerpts is indirect.
+3. NEVER invent facts that cannot be traced to at least one excerpt. If a specific
+   number, drug name, or criterion is not present in any excerpt, do not include it.
+4. NEVER write placeholder text like "[Topic]", "[Drug Name]", "Name", "Type Name".
+5. ALL string values must be real synthesised sentences — not template examples.
+6. Return ONLY valid JSON. No markdown fences, no preamble, no trailing text.
+7. Missing sections that cannot be addressed from ANY excerpt: set content/items to
+   null silently. Do NOT explain what is missing.
 
 CONTEXT WITH SOURCE TAGS:
 {context}
@@ -578,25 +594,25 @@ CONTEXT WITH SOURCE TAGS:
             return base + f"""
 QUESTION: {question}
 
-Synthesise evidence across sources. Organise by cancer subtype, not by source.
-Include trial names and exact numerical outcomes wherever present in context.
+Synthesise evidence across all sources. Organise by cancer subtype, not by source.
+Extract trial names and numerical outcomes from the excerpts wherever they appear.
 
 CONTRACT ADDITIONS:
-- Drug items MUST include trial name + numerical outcome if in context.
-- No trial name/number in context → set description to null.
-- Key Considerations section REQUIRED, minimum 2 items.
+- Drug items MUST include trial name + numerical outcome if present in any excerpt.
+- Key Considerations section REQUIRED, minimum 2 items synthesised from excerpts.
 - Items arrays must remain arrays even with one item.
+- If only partial trial data exists in excerpts, synthesise what is there and cite it.
 
 {{
-  "overview": "2-3 sentences on TKI role, approval status, overall evidence quality. [SOURCE_X]. REQUIRED — never null.",
+  "overview": "2-3 sentences on TKI role, approval status, overall evidence quality synthesised from excerpts. [SOURCE_X]. REQUIRED — never null.",
   "sections": [
     {{
       "header": "Evidence in Differentiated Thyroid Cancer (DTC)",
       "items": [
         {{
-          "name": "Exact drug name (e.g. Lenvatinib). null if not in context.",
-          "description": "Trial name + primary endpoint with exact numbers (e.g. SELECT trial: PFS 18.3 vs 3.6 months, HR 0.21) + approval status. [SOURCE_X]. null if no numerical data.",
-          "highlight": "One sentence on clinical significance. [SOURCE_X]. null if not in context."
+          "name": "Exact drug name from excerpts. null if no DTC drug appears in any excerpt.",
+          "description": "Trial name + primary endpoint with exact numbers if in excerpts, otherwise synthesise available DTC evidence. [SOURCE_X]. null only if no DTC evidence exists in any excerpt.",
+          "highlight": "Clinical significance synthesised from excerpts. [SOURCE_X]. null only if excerpts contain nothing relevant."
         }}
       ]
     }},
@@ -604,9 +620,9 @@ CONTRACT ADDITIONS:
       "header": "Evidence in Medullary Thyroid Cancer (MTC)",
       "items": [
         {{
-          "name": "Exact drug name. null if not in context.",
-          "description": "Trial name + endpoint numbers + mutation targets + approval status. [SOURCE_X]. null if no data.",
-          "highlight": "One sentence on clinical positioning. [SOURCE_X]. null if not in context."
+          "name": "Exact drug name from excerpts. null if no MTC drug appears in any excerpt.",
+          "description": "Trial name + endpoint numbers if available; otherwise synthesise available MTC evidence from excerpts. [SOURCE_X]. null only if no MTC evidence exists.",
+          "highlight": "Clinical positioning synthesised from excerpts. [SOURCE_X]. null only if no relevant MTC content."
         }}
       ]
     }},
@@ -614,9 +630,9 @@ CONTRACT ADDITIONS:
       "header": "Evidence in Anaplastic Thyroid Cancer (ATC)",
       "items": [
         {{
-          "name": "Exact drug or combination. null if not in context.",
-          "description": "Evidence strength, key outcomes with numbers if available, TKI monotherapy limitations. [SOURCE_X]. null if no data.",
-          "highlight": "Key limitation or combination rationale. [SOURCE_X]. null if not in context."
+          "name": "Exact drug or combination from excerpts. null if no ATC data in any excerpt.",
+          "description": "Evidence strength and key outcomes synthesised from excerpts. [SOURCE_X]. null only if no ATC evidence.",
+          "highlight": "Key limitation or rationale synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
     }},
@@ -625,19 +641,19 @@ CONTRACT ADDITIONS:
       "items": [
         {{
           "consideration": "Toxicity Profile",
-          "description": "Grade ≥3 adverse event rate, most common AEs with percentages if in context. [SOURCE_X]. null if not in context."
+          "description": "Synthesise adverse event information from excerpts, including percentages if stated. [SOURCE_X]. null only if no toxicity data in any excerpt."
         }},
         {{
           "consideration": "Resistance",
-          "description": "When resistance develops, salvage options if mentioned. [SOURCE_X]. null if not in context."
+          "description": "Synthesise any resistance or salvage information from excerpts. [SOURCE_X]. null only if excerpts contain nothing on resistance."
         }},
         {{
           "consideration": "Patient Selection",
-          "description": "Criteria for TKI initiation: radioiodine-refractory, symptomatic, rapidly progressive. [SOURCE_X]. null if not in context."
+          "description": "Synthesise patient selection criteria from excerpts (e.g. radioiodine-refractory, progressive disease). [SOURCE_X]. null only if no selection data in excerpts."
         }},
         {{
           "consideration": "Treatment Sequencing",
-          "description": "First-line vs second-line positioning, watchful waiting role. [SOURCE_X]. null if not in context."
+          "description": "Synthesise sequencing guidance from excerpts. [SOURCE_X]. null only if no sequencing information in any excerpt."
         }}
       ]
     }}
@@ -650,21 +666,25 @@ Return ONLY valid JSON:"""
             return base + f"""
 QUESTION: {question}
 
+Synthesise a clear, patient-facing definition from the excerpts. Even if individual
+excerpts are narrow or specialist, combine them to construct a coherent overview.
+
 CONTRACT ADDITIONS:
-- Use actual type names from context (e.g. Papillary, Follicular). NEVER "Type Name".
-- "Key Characteristics" for feature-list definitions (e.g. PTC variants, growth pattern).
-- Overview REQUIRED.
+- Use actual type names from excerpts (e.g. Papillary, Follicular). NEVER "Type Name".
+- Overview REQUIRED — synthesise from available excerpts even if they are subtype-specific.
+- If excerpts only cover specific subtypes, synthesise general disease characteristics
+  from those subtypes and cite the sources.
 
 {{
-  "overview": "2-3 sentence definition: what it is, who it affects, general outlook. [SOURCE_X]. REQUIRED.",
+  "overview": "2-3 sentence definition synthesised from excerpts: what thyroid cancer is, who it affects, general outlook. [SOURCE_X]. REQUIRED — never null.",
   "sections": [
     {{
       "header": "Key Types",
       "items": [
         {{
-          "name": "Actual type name from context. null if not in context.",
-          "description": "What distinguishes this type, incidence if mentioned. [SOURCE_X]. null if not in context.",
-          "details": "Prognosis or statistics from context. [SOURCE_X]. null if not in context."
+          "name": "Actual type name from excerpts. null only if no type information appears in any excerpt.",
+          "description": "What distinguishes this type, incidence if mentioned, synthesised from excerpts. [SOURCE_X]. null only if no type data.",
+          "details": "Prognosis or statistics from excerpts. [SOURCE_X]. null only if no prognostic data in any excerpt."
         }}
       ]
     }},
@@ -672,27 +692,27 @@ CONTRACT ADDITIONS:
       "header": "Key Characteristics",
       "items": [
         {{
-          "aspect": "Real aspect name (e.g. Growth pattern, Microscopic features, Prevalence). null if not present.",
-          "description": "Explanation from context. [SOURCE_X]. null if not in context."
+          "aspect": "Real aspect synthesised from excerpts (e.g. Growth pattern, Prevalence, Histology). null only if excerpts contain no characteristic information.",
+          "description": "Explanation synthesised from excerpts. [SOURCE_X]. null only if no relevant excerpt content."
         }}
       ]
     }},
     {{
       "header": "Causes and Risk Factors",
-      "content": "Paragraph on causes and risk factors from context. [SOURCE_X]. null if not in context."
+      "content": "Paragraph synthesising causes and risk factors from excerpts. [SOURCE_X]. null only if no excerpt mentions any cause or risk factor."
     }},
     {{
       "header": "Common Symptoms",
       "items": [
         {{
-          "symptom": "Actual symptom name from context. null if not in context.",
-          "description": "How it presents or why. [SOURCE_X]. null if not in context."
+          "symptom": "Actual symptom from excerpts. null only if no symptom information appears in any excerpt.",
+          "description": "How it presents, synthesised from excerpts. [SOURCE_X]. null only if no symptom content."
         }}
       ]
     }},
     {{
       "header": "Diagnosis and Treatment",
-      "content": "Diagnostic and treatment approach from context. [SOURCE_X]. null if not in context."
+      "content": "Diagnostic and treatment approach synthesised from excerpts. [SOURCE_X]. null only if no diagnostic or treatment content in any excerpt."
     }}
   ]
 }}
@@ -703,20 +723,23 @@ Return ONLY valid JSON:"""
             return base + f"""
 QUESTION: {question}
 
+Synthesise a comprehensive complications profile from the excerpts.
+
 CONTRACT ADDITIONS:
-- Use real complication names. NEVER write "Name" as placeholder.
-- Include exact frequency/percentage data where in context.
+- Use real complication names from excerpts. NEVER write "Name" as placeholder.
+- Include frequency/percentage data where present in excerpts; otherwise describe severity.
+- Synthesise across excerpts to populate all sections where possible.
 
 {{
-  "overview": "2-3 sentence summary of complication landscape. [SOURCE_X]. REQUIRED.",
+  "overview": "2-3 sentence summary of the complication landscape synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
     {{
       "header": "Common and Temporary Complications",
       "items": [
         {{
-          "complication": "Real name from context. null if not present.",
-          "description": "Explanation, mechanism, frequency. [SOURCE_X]. null if not in context.",
-          "frequency": "Exact percentage from context. null if not stated."
+          "complication": "Real complication name from excerpts. null only if no common complications mentioned.",
+          "description": "Explanation, mechanism, frequency synthesised from excerpts. [SOURCE_X]. null only if no relevant content.",
+          "frequency": "Exact percentage from excerpts if stated; otherwise null."
         }}
       ]
     }},
@@ -724,8 +747,8 @@ CONTRACT ADDITIONS:
       "header": "Less Common or Potentially Permanent Complications",
       "items": [
         {{
-          "complication": "Real name from context. null if not present.",
-          "description": "Explanation and long-term impact. [SOURCE_X]. null if not in context."
+          "complication": "Real complication name from excerpts. null only if no such complications mentioned.",
+          "description": "Explanation and long-term impact synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
     }},
@@ -733,14 +756,14 @@ CONTRACT ADDITIONS:
       "header": "Rare but Serious Complications",
       "items": [
         {{
-          "complication": "Real name from context. null if not present.",
-          "description": "Why serious and how managed. [SOURCE_X]. null if not in context."
+          "complication": "Real complication name from excerpts. null only if no rare complications mentioned.",
+          "description": "Why serious and how managed, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
     }},
     {{
       "header": "Management and Prevention",
-      "content": "Managing or preventing complications from context. [SOURCE_X]. null if not in context."
+      "content": "Managing or preventing complications, synthesised from excerpts. [SOURCE_X]. null only if no management content in any excerpt."
     }}
   ]
 }}
@@ -753,11 +776,12 @@ QUESTION: {question}
 
 CONTRACT ADDITIONS:
 - Extract option labels directly from the question.
-- Only include comparison rows with context data for BOTH options.
+- Synthesise comparison rows from excerpts; include a row even when only one side
+  is well-covered, noting the contrast with what is synthesised for the other.
 - For ATC vs DTC style questions, include numbered management steps.
 
 {{
-  "overview": "2-3 sentence comparison summary with clinical context. [SOURCE_X]. REQUIRED.",
+  "overview": "2-3 sentence comparison summary with clinical context synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
     {{
       "header": "Key Differences",
@@ -765,9 +789,9 @@ CONTRACT ADDITIONS:
       "option_b_label": "Exact name of second option from question.",
       "comparison_table": [
         {{
-          "aspect": "Specific aspect (e.g. Urgency, RAI response, Surgery). null if not in context.",
-          "option_a": "What first option does for this aspect. [SOURCE_X]. null if not in context.",
-          "option_b": "What second option does for this aspect. [SOURCE_X]. null if not in context."
+          "aspect": "Specific aspect synthesised from excerpts (e.g. Urgency, RAI response, Surgery). null only if no comparison data exists.",
+          "option_a": "Synthesised description for first option. [SOURCE_X]. null only if no excerpt covers this.",
+          "option_b": "Synthesised description for second option. [SOURCE_X]. null only if no excerpt covers this."
         }}
       ]
     }},
@@ -775,8 +799,8 @@ CONTRACT ADDITIONS:
       "header": "Characteristics of First Option",
       "items": [
         {{
-          "aspect": "Real characteristic from context. null if not present.",
-          "description": "Explanation. [SOURCE_X]. null if not in context."
+          "aspect": "Real characteristic from excerpts. null only if no characteristics mentioned.",
+          "description": "Synthesised explanation. [SOURCE_X]. null only if no relevant excerpt."
         }}
       ]
     }},
@@ -785,18 +809,18 @@ CONTRACT ADDITIONS:
       "steps": [
         {{
           "step": 1,
-          "title": "Real step title from context. null if not in context.",
-          "description": "What this step involves. [SOURCE_X]. null if not in context."
+          "title": "Real step title synthesised from excerpts. null only if no steps mentioned.",
+          "description": "What this step involves, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
     }},
     {{
       "header": "Shared Characteristics",
-      "content": "What both options have in common. [SOURCE_X]. null if not in context."
+      "content": "What both options have in common, synthesised from excerpts. [SOURCE_X]. null only if no shared features mentioned."
     }},
     {{
       "header": "Clinical Outcomes",
-      "content": "Comparing survival, response rates with numbers if available. [SOURCE_X]. null if not in context."
+      "content": "Comparing survival, response rates with numbers if available, synthesised from excerpts. [SOURCE_X]. null only if no outcome data in any excerpt."
     }}
   ]
 }}
@@ -808,19 +832,20 @@ Return ONLY valid JSON:"""
 QUESTION: {question}
 
 CONTRACT ADDITIONS:
-- Use real treatment/drug names. NEVER "Treatment Name".
-- Include evidence grade only if discernible from context.
+- Use real treatment/drug names from excerpts. NEVER "Treatment Name".
+- Synthesise evidence grade from context if determinable (e.g. Phase 3 RCT mentioned).
+- Combine excerpts to build the most complete treatment picture possible.
 
 {{
-  "overview": "2-3 sentence treatment landscape with guideline-recommended approaches. [SOURCE_X]. REQUIRED.",
+  "overview": "2-3 sentence treatment landscape synthesised from excerpts with guideline-recommended approaches where mentioned. [SOURCE_X]. REQUIRED.",
   "sections": [
     {{
       "header": "First-Line Treatments",
       "items": [
         {{
-          "treatment": "Real treatment name from context. null if not present.",
-          "description": "Indication, mechanism, trial result with numbers, approval status. [SOURCE_X]. null if not in context.",
-          "evidence_grade": "Phase 3 RCT / Guideline / Observational. null if not discernible."
+          "treatment": "Real treatment name from excerpts. null only if no first-line treatment mentioned.",
+          "description": "Indication, mechanism, trial result with numbers if in excerpts, approval status if mentioned. [SOURCE_X]. null only if no relevant content.",
+          "evidence_grade": "Phase 3 RCT / Guideline / Observational — synthesised from excerpts. null if not determinable."
         }}
       ]
     }},
@@ -828,21 +853,21 @@ CONTRACT ADDITIONS:
       "header": "Second-Line and Salvage Treatments",
       "items": [
         {{
-          "treatment": "Real treatment name. null if not present.",
-          "description": "When used, outcomes, trial with numbers. [SOURCE_X]. null if not in context."
+          "treatment": "Real treatment name from excerpts. null only if no second-line treatment mentioned.",
+          "description": "When used, outcomes, trial data synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
     }},
     {{
       "header": "Treatment by Cancer Subtype",
-      "content": "Mapping approved agents to DTC, MTC, ATC subtypes. [SOURCE_X]. null if not in context."
+      "content": "Mapping approved agents to DTC, MTC, ATC subtypes, synthesised from excerpts. [SOURCE_X]. null only if no subtype-treatment mapping in any excerpt."
     }},
     {{
       "header": "Key Considerations",
       "items": [
         {{
-          "consideration": "Real consideration (e.g. Monitoring, Resistance). null if not present.",
-          "description": "Concise explanation with any data. [SOURCE_X]. null if not in context."
+          "consideration": "Real consideration from excerpts (e.g. Monitoring, Resistance, Toxicity). null only if no considerations mentioned.",
+          "description": "Concise synthesised explanation with any data. [SOURCE_X]. null only if no relevant content."
         }}
       ]
     }}
@@ -856,18 +881,19 @@ Return ONLY valid JSON:"""
 QUESTION: {question}
 
 CONTRACT ADDITIONS:
-- Use real procedure/tool names (e.g. Ultrasound, FNAB, TI-RADS). NEVER "Procedure Name".
-- Include accuracy data only if stated in context.
+- Use real procedure/tool names from excerpts (e.g. Ultrasound, FNAB, TI-RADS).
+- Include accuracy data only if stated in excerpts.
+- Synthesise a complete diagnostic picture from all relevant excerpts.
 
 {{
-  "overview": "2-3 sentence summary of diagnostic approach and why it is used. [SOURCE_X]. REQUIRED.",
+  "overview": "2-3 sentence summary of the diagnostic approach and its clinical value, synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
     {{
       "header": "Key Roles",
       "items": [
         {{
-          "role": "Real role from context (e.g. Risk Stratification, Biopsy Guidance). null if not present.",
-          "description": "What this role involves, clinical value. [SOURCE_X]. null if not in context."
+          "role": "Real role from excerpts (e.g. Risk Stratification, Biopsy Guidance). null only if no role information in any excerpt.",
+          "description": "What this role involves and its clinical value, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
     }},
@@ -875,18 +901,18 @@ CONTRACT ADDITIONS:
       "header": "Key Diagnostic Features or Findings",
       "items": [
         {{
-          "feature": "Real feature (e.g. Microcalcifications, Taller-than-wide). null if not present.",
-          "description": "Clinical significance, specificity/sensitivity if stated. [SOURCE_X]. null if not in context."
+          "feature": "Real feature from excerpts (e.g. Microcalcifications, Taller-than-wide). null only if no features mentioned.",
+          "description": "Clinical significance, specificity/sensitivity if stated in excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
     }},
     {{
       "header": "Diagnostic Pathway",
-      "content": "Step-by-step process from presentation to diagnosis. [SOURCE_X]. null if not in context."
+      "content": "Step-by-step process from presentation to diagnosis, synthesised from excerpts. [SOURCE_X]. null only if no pathway information in any excerpt."
     }},
     {{
       "header": "Limitations and Considerations",
-      "content": "Known limitations of diagnostic approach. [SOURCE_X]. null if not in context."
+      "content": "Known limitations of the diagnostic approach, synthesised from excerpts. [SOURCE_X]. null only if no limitations mentioned in any excerpt."
     }}
   ]
 }}
@@ -898,18 +924,19 @@ Return ONLY valid JSON:"""
 QUESTION: {question}
 
 CONTRACT ADDITIONS:
-- Use real clinical situations. NEVER "Situation" or "Factor name".
-- Include specific size thresholds or criteria if in context.
+- Use real clinical situations from excerpts. NEVER "Situation" or "Factor name".
+- Include specific size thresholds or criteria if stated in any excerpt.
+- Synthesise timing guidance from all relevant excerpts.
 
 {{
-  "overview": "2-3 sentence summary of when and why this is recommended. [SOURCE_X]. REQUIRED.",
+  "overview": "2-3 sentence summary of when and why this is recommended, synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
     {{
       "header": "Key Indications",
       "items": [
         {{
-          "indication": "Real clinical situation from context. null if not present.",
-          "explanation": "Why this timing is recommended with supporting data. [SOURCE_X]. null if not in context."
+          "indication": "Real clinical situation from excerpts. null only if no indications in any excerpt.",
+          "explanation": "Why this timing is recommended, with supporting data synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
     }},
@@ -917,9 +944,9 @@ CONTRACT ADDITIONS:
       "header": "Size and Risk Thresholds",
       "items": [
         {{
-          "category": "Real risk/size category (e.g. High Suspicion, Low Suspicion). null if not present.",
-          "threshold": "Specific size or criterion from context. null if not stated.",
-          "recommendation": "What is recommended at this threshold. [SOURCE_X]. null if not in context."
+          "category": "Real risk/size category from excerpts (e.g. High Suspicion, Low Suspicion). null only if no thresholds in any excerpt.",
+          "threshold": "Specific size or criterion from excerpts. null only if not stated in any excerpt.",
+          "recommendation": "What is recommended at this threshold, synthesised from excerpts. [SOURCE_X]. null only if no recommendation content."
         }}
       ]
     }},
@@ -927,14 +954,14 @@ CONTRACT ADDITIONS:
       "header": "Important Considerations",
       "items": [
         {{
-          "consideration": "Real factor from context (e.g. High-risk history, Nodule growth). null if not present.",
-          "description": "How this factor influences the timing decision. [SOURCE_X]. null if not in context."
+          "consideration": "Real factor from excerpts (e.g. High-risk history, Nodule growth). null only if no considerations in any excerpt.",
+          "description": "How this factor influences the timing decision, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
     }},
     {{
       "header": "Contraindications or When Not Recommended",
-      "content": "Situations where this should be avoided or delayed. [SOURCE_X]. null if not in context."
+      "content": "Situations where this should be avoided, synthesised from excerpts. [SOURCE_X]. null only if no contraindication information in any excerpt."
     }}
   ]
 }}
@@ -946,20 +973,20 @@ Return ONLY valid JSON:"""
 QUESTION: {question}
 
 CONTRACT ADDITIONS:
-- Use exact staging nomenclature from context (T1, T2, N0, M1 etc).
-- Include age-based distinctions if in context (e.g. <55 vs ≥55 years).
-- NEVER invent criteria not present in context.
+- Use exact staging nomenclature from excerpts (T1, T2, N0, M1 etc).
+- Include age-based distinctions if mentioned in any excerpt (e.g. <55 vs ≥55 years).
+- Synthesise staging criteria from all relevant excerpts.
 
 {{
-  "overview": "2-3 sentences: staging system used, cancer type it applies to, key distinguishing feature (e.g. age cutoff). [SOURCE_X]. REQUIRED.",
+  "overview": "2-3 sentences: staging system, cancer type it applies to, key distinguishing features synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
     {{
       "header": "TNM Components",
       "items": [
         {{
-          "component": "T, N, or M (use exact letter).",
-          "description": "What this component measures. [SOURCE_X]. null if not in context.",
-          "categories": "Exact subcategories from context (e.g. T1 <1 cm, T2 1–4 cm). null if not stated."
+          "component": "T, N, or M — synthesised from excerpts.",
+          "description": "What this component measures, synthesised from excerpts. [SOURCE_X]. null only if no TNM content in any excerpt.",
+          "categories": "Exact subcategories from excerpts (e.g. T1 <1 cm, T2 1–4 cm). null only if no subcategories stated."
         }}
       ]
     }},
@@ -967,11 +994,11 @@ CONTRACT ADDITIONS:
       "header": "Stage Groupings",
       "subgroups": [
         {{
-          "subgroup": "Patient subgroup from context (e.g. Patients <55 years). null if not in context.",
+          "subgroup": "Patient subgroup from excerpts (e.g. Patients <55 years). null only if no groupings in any excerpt.",
           "stages": [
             {{
-              "stage": "Stage label (e.g. Stage I, Stage IVA). null if not in context.",
-              "criteria": "TNM criteria from context. [SOURCE_X]. null if not stated."
+              "stage": "Stage label from excerpts (e.g. Stage I, Stage IVA). null only if not in any excerpt.",
+              "criteria": "TNM criteria synthesised from excerpts. [SOURCE_X]. null only if not stated."
             }}
           ]
         }}
@@ -979,11 +1006,11 @@ CONTRACT ADDITIONS:
     }},
     {{
       "header": "Clinical vs Pathologic Staging",
-      "content": "cTNM vs pTNM distinction if in context. [SOURCE_X]. null if not in context."
+      "content": "cTNM vs pTNM distinction if mentioned in excerpts. [SOURCE_X]. null only if not addressed in any excerpt."
     }},
     {{
       "header": "Key Considerations",
-      "content": "Important caveats or clinical implications from context. [SOURCE_X]. null if not in context."
+      "content": "Important caveats or clinical implications synthesised from excerpts. [SOURCE_X]. null only if no such content in any excerpt."
     }}
   ]
 }}
@@ -996,45 +1023,46 @@ QUESTION: {question}
 
 CONTRACT ADDITIONS:
 - Three parallel tiers REQUIRED: Low, Intermediate, High.
-- Use exact criteria from context. NEVER invent thresholds.
-- Include percentage recurrence rates per tier if in context.
+- Synthesise criteria from all excerpts. If only some tiers are well-covered, synthesise
+  what is available and mark uncovered tiers as null.
+- Include percentage recurrence rates per tier if stated in any excerpt.
 
 {{
-  "overview": "2-3 sentences: stratification system (e.g. ATA 2015), what it predicts, how it guides treatment. [SOURCE_X]. REQUIRED.",
+  "overview": "2-3 sentences: stratification system (e.g. ATA 2015), what it predicts, how it guides treatment — synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
     {{
       "header": "Low Risk",
-      "recurrence_rate": "Exact percentage range from context (e.g. <5%). null if not stated.",
+      "recurrence_rate": "Exact percentage range from excerpts (e.g. <5%). null only if not stated in any excerpt.",
       "criteria": [
         {{
-          "criterion": "Real criterion from context (e.g. Intrathyroidal tumour <4 cm). null if not present.",
-          "detail": "Clarification or subcriterion. [SOURCE_X]. null if not in context."
+          "criterion": "Real criterion synthesised from excerpts. null only if no low-risk criteria in any excerpt.",
+          "detail": "Clarification synthesised from excerpts. [SOURCE_X]. null only if no supporting detail."
         }}
       ]
     }},
     {{
       "header": "Intermediate Risk",
-      "recurrence_rate": "Exact percentage range from context. null if not stated.",
+      "recurrence_rate": "Exact percentage range from excerpts. null only if not stated.",
       "criteria": [
         {{
-          "criterion": "Real criterion from context. null if not present.",
-          "detail": "Clarification. [SOURCE_X]. null if not in context."
+          "criterion": "Real criterion synthesised from excerpts. null only if no intermediate criteria in any excerpt.",
+          "detail": "Clarification synthesised from excerpts. [SOURCE_X]. null only if no supporting detail."
         }}
       ]
     }},
     {{
       "header": "High Risk",
-      "recurrence_rate": "Exact percentage range from context. null if not stated.",
+      "recurrence_rate": "Exact percentage range from excerpts. null only if not stated.",
       "criteria": [
         {{
-          "criterion": "Real criterion from context. null if not present.",
-          "detail": "Clarification. [SOURCE_X]. null if not in context."
+          "criterion": "Real criterion synthesised from excerpts. null only if no high-risk criteria in any excerpt.",
+          "detail": "Clarification synthesised from excerpts. [SOURCE_X]. null only if no supporting detail."
         }}
       ]
     }},
     {{
       "header": "Dynamic Risk Restratification",
-      "content": "How risk category can change based on treatment response. [SOURCE_X]. null if not in context."
+      "content": "How risk category can change based on treatment response, synthesised from excerpts. [SOURCE_X]. null only if not addressed in any excerpt."
     }}
   ]
 }}
@@ -1047,18 +1075,18 @@ QUESTION: {question}
 
 CONTRACT ADDITIONS:
 - Organise by impact domain: Management, Prognosis, Surgery, Surveillance.
-- Include specific data (percentages, survival differences) from context.
-- Include summary table if context supports it.
+- Include specific data (percentages, survival differences) from excerpts where available.
+- Synthesise across all excerpts to populate all domains where possible.
 
 {{
-  "overview": "2-3 sentences: how common is this factor, its primary clinical impact, overall significance. [SOURCE_X]. REQUIRED.",
+  "overview": "2-3 sentences: how common is this factor, its primary clinical impact, overall significance — synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
     {{
       "header": "Impact on Management",
       "items": [
         {{
-          "aspect": "Real management aspect (e.g. Surgical Approach, RAI Therapy). null if not present.",
-          "description": "How this factor changes management with specific recommendations. [SOURCE_X]. null if not in context."
+          "aspect": "Real management aspect from excerpts (e.g. Surgical Approach, RAI Therapy). null only if no management impact in any excerpt.",
+          "description": "How this factor changes management, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
     }},
@@ -1066,21 +1094,21 @@ CONTRACT ADDITIONS:
       "header": "Impact on Prognosis",
       "items": [
         {{
-          "aspect": "Real prognostic aspect (e.g. Recurrence Risk, Overall Survival). null if not present.",
-          "description": "Specific impact with data where available. [SOURCE_X]. null if not in context."
+          "aspect": "Real prognostic aspect from excerpts (e.g. Recurrence Risk, Overall Survival). null only if no prognostic data in any excerpt.",
+          "description": "Specific impact with data synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
     }},
     {{
       "header": "Age-Related Differences",
-      "content": "How impact differs by patient age if in context. [SOURCE_X]. null if not in context."
+      "content": "How impact differs by patient age, synthesised from excerpts. [SOURCE_X]. null only if no age-related content in any excerpt."
     }},
     {{
       "header": "Summary of Impact",
       "table": [
         {{
-          "domain": "Domain (e.g. Recurrence, Mortality, Surgery, Surveillance). null if not in context.",
-          "impact": "One-sentence impact from context. [SOURCE_X]. null if not in context."
+          "domain": "Domain from excerpts (e.g. Recurrence, Mortality, Surgery, Surveillance). null only if no domain data.",
+          "impact": "One-sentence synthesised impact. [SOURCE_X]. null only if no relevant content."
         }}
       ]
     }}
@@ -1095,19 +1123,19 @@ QUESTION: {question}
 
 CONTRACT ADDITIONS:
 - Organise by surveillance modality: blood tests, imaging, scans.
-- Use real test names. NEVER "Test Name".
-- Include when each is used and what it detects.
+- Use real test names from excerpts. NEVER "Test Name".
+- Synthesise a complete surveillance plan from all relevant excerpts.
 
 {{
-  "overview": "2-3 sentences: what surveillance consists of, primary tests, risk-stratified approach. [SOURCE_X]. REQUIRED.",
+  "overview": "2-3 sentences: what surveillance consists of, primary tests, risk-stratified approach — synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
     {{
       "header": "Key Surveillance Modalities",
       "items": [
         {{
-          "modality": "Real test name (e.g. Thyroglobulin Testing, Neck Ultrasound, PET-CT). null if not present.",
-          "description": "What it detects, when used, why preferred. [SOURCE_X]. null if not in context.",
-          "frequency": "How often performed if stated. null if not stated."
+          "modality": "Real test name from excerpts (e.g. Thyroglobulin Testing, Neck Ultrasound, PET-CT). null only if no modality information in any excerpt.",
+          "description": "What it detects, when used, why preferred — synthesised from excerpts. [SOURCE_X]. null only if no relevant content.",
+          "frequency": "How often performed if stated in any excerpt. null only if no frequency data."
         }}
       ]
     }},
@@ -1115,14 +1143,14 @@ CONTRACT ADDITIONS:
       "header": "Surveillance Strategy by Risk Group",
       "items": [
         {{
-          "risk_group": "Real risk group (e.g. Low-risk, High-risk). null if not present.",
-          "approach": "Recommended surveillance approach for this group. [SOURCE_X]. null if not in context."
+          "risk_group": "Real risk group from excerpts (e.g. Low-risk, High-risk). null only if no risk stratification in any excerpt.",
+          "approach": "Recommended surveillance approach synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
     }},
     {{
       "header": "Special Considerations",
-      "content": "Tg antibody interference, stimulated Tg testing, or other nuances. [SOURCE_X]. null if not in context."
+      "content": "Tg antibody interference, stimulated Tg testing, or other nuances synthesised from excerpts. [SOURCE_X]. null only if no special considerations in any excerpt."
     }}
   ]
 }}
@@ -1135,18 +1163,19 @@ QUESTION: {question}
 
 CONTRACT ADDITIONS:
 - Organise by: patterns by location, detection methods, risk factors, clinical signs.
-- Use exact location names and percentages from context.
+- Use exact location names and percentages from excerpts where available.
+- Synthesise a complete recurrence picture from all relevant excerpts.
 
 {{
-  "overview": "2-3 sentences: overall recurrence rate, most common site, primary detection method. [SOURCE_X]. REQUIRED.",
+  "overview": "2-3 sentences: overall recurrence rate, most common site, primary detection method — synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
     {{
       "header": "Common Patterns of Recurrence",
       "items": [
         {{
-          "pattern": "Real location (e.g. Regional Lymph Nodes, Thyroid Bed, Distant Metastasis). null if not present.",
-          "description": "Where exactly, percentage of recurrences, what it involves. [SOURCE_X]. null if not in context.",
-          "frequency": "Percentage from context. null if not stated."
+          "pattern": "Real location from excerpts (e.g. Regional Lymph Nodes, Thyroid Bed, Distant Metastasis). null only if no recurrence patterns in any excerpt.",
+          "description": "Where exactly, percentage of recurrences, synthesised from excerpts. [SOURCE_X]. null only if no relevant content.",
+          "frequency": "Percentage from excerpts if stated. null only if not in any excerpt."
         }}
       ]
     }},
@@ -1154,8 +1183,8 @@ CONTRACT ADDITIONS:
       "header": "Methods of Detection",
       "items": [
         {{
-          "method": "Real detection method (e.g. Serum Thyroglobulin, Neck Ultrasound, PET-CT). null if not present.",
-          "description": "How it detects recurrence, when used, its role. [SOURCE_X]. null if not in context."
+          "method": "Real detection method from excerpts (e.g. Serum Thyroglobulin, Neck Ultrasound, PET-CT). null only if no detection methods in any excerpt.",
+          "description": "How it detects recurrence, when used — synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
     }},
@@ -1163,14 +1192,14 @@ CONTRACT ADDITIONS:
       "header": "Risk Factors for Recurrence",
       "items": [
         {{
-          "factor": "Real risk factor (e.g. LN metastasis at diagnosis, BRAF mutation). null if not present.",
-          "description": "Why this increases recurrence risk. [SOURCE_X]. null if not in context."
+          "factor": "Real risk factor from excerpts (e.g. LN metastasis at diagnosis, BRAF mutation). null only if no risk factors in any excerpt.",
+          "description": "Why this increases recurrence risk, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
     }},
     {{
       "header": "Clinical Signs of Recurrence",
-      "content": "Symptoms or signs of recurrence from context. [SOURCE_X]. null if not in context."
+      "content": "Symptoms or signs of recurrence synthesised from excerpts. [SOURCE_X]. null only if no clinical signs in any excerpt."
     }}
   ]
 }}
@@ -1182,44 +1211,45 @@ Return ONLY valid JSON:"""
 QUESTION: {question}
 
 CONTRACT ADDITIONS:
-- Use exact mutation names and prevalence percentages from context.
+- Use exact mutation names and prevalence percentages from excerpts.
 - Organise by: mechanism, cancer type association, prognosis, therapeutic implications, testing.
+- Synthesise a complete molecular profile from all relevant excerpts.
 
 {{
-  "overview": "2-3 sentences: what this gene/mutation is, how common it is, overall clinical importance. [SOURCE_X]. REQUIRED.",
+  "overview": "2-3 sentences: what this gene/mutation is, how common it is, overall clinical importance — synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
     {{
       "header": "Mechanism of Action",
-      "content": "How this mutation drives cancer growth and which pathway it activates. [SOURCE_X]. null if not in context."
+      "content": "How this mutation drives cancer growth and which pathway it activates, synthesised from excerpts. [SOURCE_X]. null only if no mechanism information in any excerpt."
     }},
     {{
       "header": "Prevalence and Cancer Type Association",
       "items": [
         {{
-          "cancer_type": "Real cancer type (e.g. Papillary Thyroid Cancer). null if not present.",
-          "prevalence": "Exact percentage from context (e.g. 40–70% of PTC). null if not stated.",
-          "mutation_subtype": "Specific mutation subtype (e.g. V600E, M918T). null if not in context.",
-          "description": "Clinical characteristics associated with this mutation. [SOURCE_X]. null if not in context."
+          "cancer_type": "Real cancer type from excerpts (e.g. Papillary Thyroid Cancer). null only if no type association in any excerpt.",
+          "prevalence": "Exact percentage from excerpts (e.g. 40–70% of PTC). null only if not stated in any excerpt.",
+          "mutation_subtype": "Specific mutation subtype from excerpts (e.g. V600E, M918T). null only if not in any excerpt.",
+          "description": "Clinical characteristics associated with this mutation, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
     }},
     {{
       "header": "Prognostic Significance",
-      "content": "Whether mutation predicts aggressive behaviour, recurrence, or survival. [SOURCE_X]. null if not in context."
+      "content": "Whether mutation predicts aggressive behaviour, recurrence, or survival — synthesised from excerpts. [SOURCE_X]. null only if no prognostic data in any excerpt."
     }},
     {{
       "header": "Therapeutic Implications",
       "items": [
         {{
-          "therapy": "Real targeted therapy (e.g. Dabrafenib + Trametinib). null if not present.",
-          "indication": "What mutation this targets. [SOURCE_X]. null if not in context.",
-          "outcome": "Key outcome data if available. [SOURCE_X]. null if not in context."
+          "therapy": "Real targeted therapy from excerpts (e.g. Dabrafenib + Trametinib). null only if no therapy mentioned in any excerpt.",
+          "indication": "What mutation this targets, synthesised from excerpts. [SOURCE_X]. null only if no indication content.",
+          "outcome": "Key outcome data synthesised from excerpts. [SOURCE_X]. null only if no outcome data."
         }}
       ]
     }},
     {{
       "header": "Genetic Testing Guidance",
-      "content": "When to test, method used, clinical decisions it informs. [SOURCE_X]. null if not in context."
+      "content": "When to test, method used, clinical decisions it informs — synthesised from excerpts. [SOURCE_X]. null only if no testing guidance in any excerpt."
     }}
   ]
 }}
