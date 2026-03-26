@@ -7,18 +7,18 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from sentence_transformers import CrossEncoder
 
-# Import faithfulness evaluator
 try:
     from .faithfulness_evaluator import FaithfulnessEvaluator
+    from .credibility_evaluator import CredibilityEvaluator
 except ImportError:
     import sys
     sys.path.insert(0, os.path.dirname(__file__))
     from faithfulness_evaluator import FaithfulnessEvaluator
+    from credibility_evaluator import CredibilityEvaluator
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Evidence level definitions for confidence scoring
 EVIDENCE_LEVEL_WEIGHTS: Dict[int, Tuple[str, float]] = {
     1: ("Guidelines / Consensus", 1.00),
     2: ("Systematic Review / Meta-analysis", 0.90),
@@ -29,12 +29,11 @@ EVIDENCE_LEVEL_WEIGHTS: Dict[int, Tuple[str, float]] = {
     7: ("Case Reports / Series", 0.40),
 }
 
-# Retrieval configuration
-FIRST_STAGE_RETRIEVAL = 100
-SECOND_STAGE_TOP_K = 20
-MAX_SOURCES = 10
-MAX_CHUNKS_PER_SOURCE = 3
-MAX_EXCERPT_CHARS = 1200
+FIRST_STAGE_RETRIEVAL  = 100
+SECOND_STAGE_TOP_K     = 20
+MAX_SOURCES            = 10
+MAX_CHUNKS_PER_SOURCE  = 3
+MAX_EXCERPT_CHARS      = 1200
 MAX_TOTAL_CONTEXT_CHARS = 10000
 
 
@@ -47,11 +46,11 @@ class QAPipeline:
         instruction_file: str = "instructions/rag_instructions.txt",
         cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
     ):
-        self.embedder = embedder
+        self.embedder     = embedder
         self.vector_store = vector_store
-        self.llm = llm_client
+        self.llm          = llm_client
 
-        env = os.getenv("ENV", "local").lower()
+        env  = os.getenv("ENV", "local").lower()
         base = Path(__file__).parent if env == "prod" else Path(".")
         self.instructions = (base / instruction_file).read_text(encoding="utf-8")
 
@@ -63,28 +62,28 @@ class QAPipeline:
         self.faithfulness_evaluator = FaithfulnessEvaluator(self.llm)
         logger.info("Faithfulness evaluator initialized")
 
+        logger.info("Initializing credibility evaluator")
+        self.credibility_evaluator = CredibilityEvaluator(
+            pipeline=self,
+            llm=self.llm,
+        )
+        logger.info("Credibility evaluator initialized")
+
+        # Unanswerable questions for M5 — populated once at app startup
+        # via pipeline.credibility_evaluator.unanswerable_cache
+        # Set by app.py after init: pipeline.credibility_evaluator.unanswerable_cache = [...]
+        self.credibility_evaluator.unanswerable_cache: Optional[List[str]] = None
+
     # =========================================================================
-    # CLASSIFICATION — Three-layer defence
+    # CLASSIFICATION
     # =========================================================================
 
     def _classify_question_type(self, question: str) -> str:
-        """
-        Classify question into one of 13 types using a three-layer defence:
-          Layer 1: _keyword_preclassify  (deterministic, no LLM)
-          Layer 2: LLM classifier
-          Layer 3: post-LLM safety net reclassifiers
-
-        Types: definition, complications, comparison, treatment, diagnosis,
-               timing, evidence, staging, risk_stratification, impact,
-               surveillance, recurrence, molecular
-        """
-        # LAYER 1
         pre_check = self._keyword_preclassify(question)
         if pre_check:
             logger.info(f"Pre-classified by keyword: {pre_check}")
             return pre_check
 
-        # LAYER 2
         classification_prompt = f"""Classify this thyroid cancer question into ONE category.
 
 Categories:
@@ -135,7 +134,6 @@ Return ONLY the category name (one word), nothing else:"""
                 logger.warning(f"Invalid category '{category}', defaulting to definition")
                 category = "definition"
 
-            # LAYER 3
             if category == "definition":
                 category = self._reclassify_if_diagnostic_tool(question, category)
             if category == "definition":
@@ -151,14 +149,8 @@ Return ONLY the category name (one word), nothing else:"""
             return "definition"
 
     def _keyword_preclassify(self, question: str) -> Optional[str]:
-        """
-        Deterministic keyword pre-check before LLM.
-        Checked in priority order — most specific first.
-        Returns category string or None to fall through to LLM.
-        """
         q = question.lower().strip()
 
-        # ── Molecular (before definition — "What is BRAF" is molecular) ──────
         molecular_genes = [
             "braf", "ret", "tert", "ntrk", "ras", "nras", "kras", "hras",
             "pax8", "pparg", "tp53", "pten", "dicer1", "akt1", "v600e", "m918t",
@@ -174,7 +166,6 @@ Return ONLY the category name (one word), nothing else:"""
             if any(w in q for w in ["role", "mutation", "what is", "how does", "relate", "driver", "target"]):
                 return "molecular"
 
-        # ── Staging ───────────────────────────────────────────────────────────
         staging_phrases = [
             "ajcc", "tnm", "staging", "how is thyroid cancer staged",
             "what are the stages", "stage i", "stage ii", "stage iii", "stage iv",
@@ -182,7 +173,6 @@ Return ONLY the category name (one word), nothing else:"""
         if any(phrase in q for phrase in staging_phrases):
             return "staging"
 
-        # ── Risk stratification ───────────────────────────────────────────────
         risk_phrases = [
             "low-risk vs", "low risk vs", "define low-risk", "define low risk",
             "risk categories", "risk stratification", "risk stratify",
@@ -193,7 +183,6 @@ Return ONLY the category name (one word), nothing else:"""
         if any(phrase in q for phrase in risk_phrases):
             return "risk_stratification"
 
-        # ── Impact ────────────────────────────────────────────────────────────
         impact_phrases = [
             "how does lymph node", "how does nodal", "how does metastasis affect",
             "how does invasion affect", "how does extension affect",
@@ -204,7 +193,6 @@ Return ONLY the category name (one word), nothing else:"""
         if any(phrase in q for phrase in impact_phrases):
             return "impact"
 
-        # ── Surveillance ──────────────────────────────────────────────────────
         surveillance_phrases = [
             "surveillance after", "follow-up after", "follow up after",
             "monitoring after", "tests after treatment", "imaging after",
@@ -214,7 +202,6 @@ Return ONLY the category name (one word), nothing else:"""
         if any(phrase in q for phrase in surveillance_phrases):
             return "surveillance"
 
-        # ── Recurrence ────────────────────────────────────────────────────────
         recurrence_phrases = [
             "patterns of recurrence", "pattern of recurrence",
             "how is recurrence detected", "how does thyroid cancer recur",
@@ -224,7 +211,6 @@ Return ONLY the category name (one word), nothing else:"""
         if any(phrase in q for phrase in recurrence_phrases):
             return "recurrence"
 
-        # ── Evidence ──────────────────────────────────────────────────────────
         evidence_phrases = [
             "what is the evidence", "what is the clinical evidence",
             "what evidence exists", "what does the evidence",
@@ -238,7 +224,6 @@ Return ONLY the category name (one word), nothing else:"""
         if any(phrase in q for phrase in evidence_phrases):
             return "evidence"
 
-        # ── Complications ─────────────────────────────────────────────────────
         complication_phrases = [
             "what are the complications", "what are complications",
             "what are the risks of", "what are risks of",
@@ -249,7 +234,6 @@ Return ONLY the category name (one word), nothing else:"""
         if any(phrase in q for phrase in complication_phrases):
             return "complications"
 
-        # ── Comparison ────────────────────────────────────────────────────────
         comparison_phrases = [
             " vs ", " versus ", "difference between", "compare ",
             "how does management differ", "how does it differ",
@@ -258,7 +242,6 @@ Return ONLY the category name (one word), nothing else:"""
         if any(phrase in q for phrase in comparison_phrases):
             return "comparison"
 
-        # ── Timing ────────────────────────────────────────────────────────────
         timing_starters = [
             "when should", "when is", "when to ", "when do ", "when are", "when would",
         ]
@@ -268,7 +251,6 @@ Return ONLY the category name (one word), nothing else:"""
         return None
 
     def _reclassify_if_diagnostic_tool(self, question: str, original_category: str) -> str:
-        """Post-LLM safety net: reclassify definition → diagnosis for diagnostic tools."""
         q = question.lower()
         diagnostic_tools = [
             "ultrasound", "ultrasonography", "sonography", "fnab", "fna",
@@ -291,7 +273,6 @@ Return ONLY the category name (one word), nothing else:"""
         return original_category
 
     def _reclassify_if_evidence_question(self, question: str, original_category: str) -> str:
-        """Post-LLM safety net: reclassify definition → evidence."""
         q = question.lower()
         strong_phrases = [
             "what is the evidence", "evidence for", "evidence of", "evidence on",
@@ -299,7 +280,6 @@ Return ONLY the category name (one word), nothing else:"""
             "how effective is", "what studies", "clinical evidence", "trial data",
         ]
         if any(phrase in q for phrase in strong_phrases):
-            logger.info(f"Reclassifying '{question}' → evidence (strong phrase)")
             return "evidence"
         weak = [
             "evidence", "trial", "study", "studies", "research", "efficacy",
@@ -308,25 +288,21 @@ Return ONLY the category name (one word), nothing else:"""
             "phase 3", "phase 2", "rct",
         ]
         if sum(1 for w in weak if w in q) >= 2:
-            logger.info(f"Reclassifying '{question}' → evidence (multiple weak indicators)")
             return "evidence"
         return original_category
 
     def _reclassify_if_molecular_question(self, question: str, original_category: str) -> str:
-        """Post-LLM safety net: reclassify definition → molecular for gene questions."""
         q = question.lower()
         genes = ["braf", "ret", "tert", "ntrk", "ras", "nras", "kras", "pten", "tp53"]
         molecular_context = [
             "mutation", "gene", "oncogene", "proto-oncogene", "molecular",
             "pathway", "mapk", "driver", "germline", "somatic", "hereditary",
         ]
-        mentions_gene = any(gene in q for gene in genes)
+        mentions_gene    = any(gene in q for gene in genes)
         mentions_context = any(ctx in q for ctx in molecular_context)
         if mentions_gene and mentions_context:
-            logger.info(f"Reclassifying '{question}' → molecular")
             return "molecular"
         if mentions_gene and any(w in q for w in ["role", "relate", "what is", "how does"]):
-            logger.info(f"Reclassifying '{question}' → molecular (gene + role)")
             return "molecular"
         return original_category
 
@@ -346,13 +322,13 @@ Return ONLY the category name (one word), nothing else:"""
         pairs = []
         for chunk in chunks:
             doc_text = chunk.get("text", "")
-            title = chunk.get("title", "")
+            title    = chunk.get("title", "")
             combined = f"{title}. {doc_text}" if title and title not in doc_text else doc_text
             pairs.append([question, combined[:2000]])
         scores = self.cross_encoder.predict(pairs)
         for idx, chunk in enumerate(chunks):
             chunk["score"] = float(scores[idx])
-        reranked = sorted(chunks, key=lambda x: x.get("score", 0), reverse=True)
+        reranked   = sorted(chunks, key=lambda x: x.get("score", 0), reverse=True)
         top_chunks = reranked[:top_k]
         logger.info(f"Re-ranking complete: top={top_chunks[0]['score']:.4f}")
         for i, chunk in enumerate(top_chunks[:3], 1):
@@ -362,17 +338,23 @@ Return ONLY the category name (one word), nothing else:"""
     def diagnose_retrieval(self, question: str, k: int = 10) -> Dict[str, Any]:
         logger.info("=== DIAGNOSTIC MODE ===")
         sub_queries = self._expand_query_with_llm(question)
-        diagnosis = {"original_question": question, "sub_queries_generated": sub_queries, "retrieval_results": []}
+        diagnosis   = {
+            "original_question":    question,
+            "sub_queries_generated": sub_queries,
+            "retrieval_results":    [],
+        }
         for idx, sub_query in enumerate(sub_queries, 1):
             chunks = self.vector_store.search(sub_query, k=k)
             result = {"query": sub_query, "chunks_found": len(chunks), "sample_chunks": []}
             for i, chunk in enumerate(chunks[:3], 1):
                 result["sample_chunks"].append({
-                    "rank": i, "title": chunk.get("title", "No title"),
-                    "year": chunk.get("year", "Unknown"), "pmid": chunk.get("pmid", "Unknown"),
+                    "rank":           i,
+                    "title":          chunk.get("title", "No title"),
+                    "year":           chunk.get("year", "Unknown"),
+                    "pmid":           chunk.get("pmid", "Unknown"),
                     "evidence_level": chunk.get("evidence_level", "Unknown"),
-                    "score": chunk.get("score", 0.0),
-                    "text_preview": chunk.get("text", "")[:400] + "..."
+                    "score":          chunk.get("score", 0.0),
+                    "text_preview":   chunk.get("text", "")[:400] + "...",
                 })
             diagnosis["retrieval_results"].append(result)
         logger.info("=== END DIAGNOSTIC ===")
@@ -392,7 +374,7 @@ Question: {question}
 Return ONLY a JSON array of 3-5 search queries, no other text:"""
         try:
             response = self.llm.ask(expansion_prompt)
-            cleaned = response.strip()
+            cleaned  = response.strip()
             if cleaned.startswith("```"):
                 cleaned = re.sub(r'^```(?:json)?\s*\n?', '', cleaned)
                 cleaned = re.sub(r'\n?```\s*$', '', cleaned)
@@ -409,7 +391,7 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
             return self._create_fallback_queries(question)
 
     def _add_fallback_queries(self, original_question: str, existing_queries: List[str]) -> List[str]:
-        q = original_question.lower()
+        q          = original_question.lower()
         additional = []
 
         if any(w in q for w in ["evidence", "trial", "efficacy", "outcome", "study", "data", "effective"]):
@@ -460,7 +442,10 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
 
     def _extract_topic(self, question: str) -> Optional[str]:
         q = question.lower()
-        for pattern in [r'(?:of|for)\s+(.+?)(?:\?|$)', r'(?:what|how)\s+(?:is|are)\s+(.+?)(?:\?|treated|diagnosed)']:
+        for pattern in [
+            r'(?:of|for)\s+(.+?)(?:\?|$)',
+            r'(?:what|how)\s+(?:is|are)\s+(.+?)(?:\?|treated|diagnosed)',
+        ]:
             match = re.search(pattern, q)
             if match:
                 topic = match.group(1).strip()
@@ -469,17 +454,22 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
         return None
 
     def _create_fallback_queries(self, question: str) -> List[str]:
-        q = question.lower()
+        q       = question.lower()
         queries = [question]
         if any(w in q for w in ["complication", "risk", "adverse", "side effect"]):
             topic = self._extract_topic(question) or "thyroid cancer treatment"
-            queries.extend([f"complications {topic}", f"adverse effects {topic}", f"toxicity {topic}"])
+            queries.extend([
+                f"complications {topic}", f"adverse effects {topic}", f"toxicity {topic}",
+            ])
         elif any(w in q for w in ["surgical", "surgery", "procedure", "operation"]):
-            queries.extend([f"{question.replace('?','')} complications", f"{question.replace('?','')} risks"])
+            queries.extend([
+                f"{question.replace('?','')} complications",
+                f"{question.replace('?','')} risks",
+            ])
         return queries
 
     def _deduplicate_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        seen = set()
+        seen   = set()
         unique = []
         for chunk in chunks:
             chunk_id = f"{chunk.get('pmid','unknown')}||{hash(chunk.get('text','')[:200].strip())}"
@@ -489,31 +479,33 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
         logger.info(f"Deduplicated {len(chunks)} → {len(unique)} chunks")
         return unique
 
-    def _build_tagged_context(self, retrieved: List[Dict[str, Any]]) -> Tuple[str, Dict[str, Dict]]:
+    def _build_tagged_context(
+        self, retrieved: List[Dict[str, Any]]
+    ) -> Tuple[str, Dict[str, Dict]]:
         grouped: Dict[str, List[Dict[str, Any]]] = {}
         for r in retrieved:
             key = str(r.get("pmid") or r.get("title"))
             grouped.setdefault(key, []).append(r)
 
-        source_map = {}
+        source_map  = {}
         tagged_parts = []
-        total_chars = 0
-        source_id = 1
+        total_chars  = 0
+        source_id    = 1
 
         for group in grouped.values():
             if source_id > MAX_SOURCES:
                 break
-            meta = group[0]
+            meta       = group[0]
             source_tag = f"SOURCE_{source_id}"
             source_map[source_tag] = {
-                "title": meta.get("title", "Unknown"),
-                "year": meta.get("year", "Unknown"),
-                "pmid": meta.get("pmid", "Unknown"),
-                "evidence_level": meta.get("evidence_level", "Unknown"),
+                "title":               meta.get("title", "Unknown"),
+                "year":                meta.get("year", "Unknown"),
+                "pmid":                meta.get("pmid", "Unknown"),
+                "evidence_level":      meta.get("evidence_level", "Unknown"),
                 "cross_encoder_score": meta.get("score", 0.0),
             }
             for chunk in group[:MAX_CHUNKS_PER_SOURCE]:
-                text = chunk.get("text", "")[:MAX_EXCERPT_CHARS]
+                text        = chunk.get("text", "")[:MAX_EXCERPT_CHARS]
                 tagged_text = f"[{source_tag}] {text}"
                 if total_chars + len(tagged_text) > MAX_TOTAL_CONTEXT_CHARS:
                     break
@@ -526,13 +518,16 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
         return context, source_map
 
     def _compute_confidence(self, retrieved: List[Dict[str, Any]]) -> Dict[str, Any]:
-        levels = [r.get("evidence_level") for r in retrieved if r.get("evidence_level") in EVIDENCE_LEVEL_WEIGHTS]
+        levels = [
+            r.get("evidence_level") for r in retrieved
+            if r.get("evidence_level") in EVIDENCE_LEVEL_WEIGHTS
+        ]
         if not levels:
             return {"label": "Low", "score": 0, "breakdown": "No evidence metadata"}
-        weights = [EVIDENCE_LEVEL_WEIGHTS[l][1] for l in levels]
-        score = int(round((sum(weights) / len(weights)) * 100))
-        label = "High" if score >= 85 else "Medium" if score >= 65 else "Low"
-        breakdown = "; ".join(
+        weights    = [EVIDENCE_LEVEL_WEIGHTS[l][1] for l in levels]
+        score      = int(round((sum(weights) / len(weights)) * 100))
+        label      = "High" if score >= 85 else "Medium" if score >= 65 else "Low"
+        breakdown  = "; ".join(
             f"Level {l} ({EVIDENCE_LEVEL_WEIGHTS[l][0]}): {levels.count(l)}"
             for l in sorted(set(levels))
         )
@@ -543,20 +538,6 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
     # =========================================================================
 
     def _create_type_specific_prompt(self, question: str, context: str, question_type: str) -> str:
-        """
-        Build a question-type-specific prompt returning structured JSON.
-        All 13 types supported:
-          definition, complications, comparison, treatment, diagnosis, timing,
-          evidence, staging, risk_stratification, impact, surveillance,
-          recurrence, molecular
-
-        SYNTHESIS MODE (relaxed null override):
-          The LLM is instructed to synthesise from available excerpts rather than
-          collapsing fields to null whenever excerpts are sparse. Every synthesised
-          claim must still carry a [SOURCE_X] tag so the user can trace it back.
-          Fields are set to null ONLY when no excerpt in the context addresses
-          that topic at all — not merely because the excerpt wording is imperfect.
-        """
         base = f"""
 {self.instructions}
 
@@ -589,7 +570,6 @@ CONTEXT WITH SOURCE TAGS:
 
 """
 
-        # ── EVIDENCE ──────────────────────────────────────────────────────────
         if question_type == "evidence":
             return base + f"""
 QUESTION: {question}
@@ -661,19 +641,12 @@ CONTRACT ADDITIONS:
 }}
 Return ONLY valid JSON:"""
 
-        # ── DEFINITION ────────────────────────────────────────────────────────
         elif question_type == "definition":
             return base + f"""
 QUESTION: {question}
 
 Synthesise a clear, patient-facing definition from the excerpts. Even if individual
 excerpts are narrow or specialist, combine them to construct a coherent overview.
-
-CONTRACT ADDITIONS:
-- Use actual type names from excerpts (e.g. Papillary, Follicular). NEVER "Type Name".
-- Overview REQUIRED — synthesise from available excerpts even if they are subtype-specific.
-- If excerpts only cover specific subtypes, synthesise general disease characteristics
-  from those subtypes and cite the sources.
 
 {{
   "overview": "2-3 sentence definition synthesised from excerpts: what thyroid cancer is, who it affects, general outlook. [SOURCE_X]. REQUIRED — never null.",
@@ -692,7 +665,7 @@ CONTRACT ADDITIONS:
       "header": "Key Characteristics",
       "items": [
         {{
-          "aspect": "Real aspect synthesised from excerpts (e.g. Growth pattern, Prevalence, Histology). null only if excerpts contain no characteristic information.",
+          "aspect": "Real aspect synthesised from excerpts. null only if excerpts contain no characteristic information.",
           "description": "Explanation synthesised from excerpts. [SOURCE_X]. null only if no relevant excerpt content."
         }}
       ]
@@ -718,17 +691,9 @@ CONTRACT ADDITIONS:
 }}
 Return ONLY valid JSON:"""
 
-        # ── COMPLICATIONS ─────────────────────────────────────────────────────
         elif question_type == "complications":
             return base + f"""
 QUESTION: {question}
-
-Synthesise a comprehensive complications profile from the excerpts.
-
-CONTRACT ADDITIONS:
-- Use real complication names from excerpts. NEVER write "Name" as placeholder.
-- Include frequency/percentage data where present in excerpts; otherwise describe severity.
-- Synthesise across excerpts to populate all sections where possible.
 
 {{
   "overview": "2-3 sentence summary of the complication landscape synthesised from excerpts. [SOURCE_X]. REQUIRED.",
@@ -769,16 +734,9 @@ CONTRACT ADDITIONS:
 }}
 Return ONLY valid JSON:"""
 
-        # ── COMPARISON ────────────────────────────────────────────────────────
         elif question_type == "comparison":
             return base + f"""
 QUESTION: {question}
-
-CONTRACT ADDITIONS:
-- Extract option labels directly from the question.
-- Synthesise comparison rows from excerpts; include a row even when only one side
-  is well-covered, noting the contrast with what is synthesised for the other.
-- For ATC vs DTC style questions, include numbered management steps.
 
 {{
   "overview": "2-3 sentence comparison summary with clinical context synthesised from excerpts. [SOURCE_X]. REQUIRED.",
@@ -789,7 +747,7 @@ CONTRACT ADDITIONS:
       "option_b_label": "Exact name of second option from question.",
       "comparison_table": [
         {{
-          "aspect": "Specific aspect synthesised from excerpts (e.g. Urgency, RAI response, Surgery). null only if no comparison data exists.",
+          "aspect": "Specific aspect synthesised from excerpts. null only if no comparison data exists.",
           "option_a": "Synthesised description for first option. [SOURCE_X]. null only if no excerpt covers this.",
           "option_b": "Synthesised description for second option. [SOURCE_X]. null only if no excerpt covers this."
         }}
@@ -826,18 +784,12 @@ CONTRACT ADDITIONS:
 }}
 Return ONLY valid JSON:"""
 
-        # ── TREATMENT ─────────────────────────────────────────────────────────
         elif question_type == "treatment":
             return base + f"""
 QUESTION: {question}
 
-CONTRACT ADDITIONS:
-- Use real treatment/drug names from excerpts. NEVER "Treatment Name".
-- Synthesise evidence grade from context if determinable (e.g. Phase 3 RCT mentioned).
-- Combine excerpts to build the most complete treatment picture possible.
-
 {{
-  "overview": "2-3 sentence treatment landscape synthesised from excerpts with guideline-recommended approaches where mentioned. [SOURCE_X]. REQUIRED.",
+  "overview": "2-3 sentence treatment landscape synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
     {{
       "header": "First-Line Treatments",
@@ -866,7 +818,7 @@ CONTRACT ADDITIONS:
       "header": "Key Considerations",
       "items": [
         {{
-          "consideration": "Real consideration from excerpts (e.g. Monitoring, Resistance, Toxicity). null only if no considerations mentioned.",
+          "consideration": "Real consideration from excerpts. null only if no considerations mentioned.",
           "description": "Concise synthesised explanation with any data. [SOURCE_X]. null only if no relevant content."
         }}
       ]
@@ -875,15 +827,9 @@ CONTRACT ADDITIONS:
 }}
 Return ONLY valid JSON:"""
 
-        # ── DIAGNOSIS ─────────────────────────────────────────────────────────
         elif question_type == "diagnosis":
             return base + f"""
 QUESTION: {question}
-
-CONTRACT ADDITIONS:
-- Use real procedure/tool names from excerpts (e.g. Ultrasound, FNAB, TI-RADS).
-- Include accuracy data only if stated in excerpts.
-- Synthesise a complete diagnostic picture from all relevant excerpts.
 
 {{
   "overview": "2-3 sentence summary of the diagnostic approach and its clinical value, synthesised from excerpts. [SOURCE_X]. REQUIRED.",
@@ -892,7 +838,7 @@ CONTRACT ADDITIONS:
       "header": "Key Roles",
       "items": [
         {{
-          "role": "Real role from excerpts (e.g. Risk Stratification, Biopsy Guidance). null only if no role information in any excerpt.",
+          "role": "Real role from excerpts. null only if no role information in any excerpt.",
           "description": "What this role involves and its clinical value, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
@@ -901,7 +847,7 @@ CONTRACT ADDITIONS:
       "header": "Key Diagnostic Features or Findings",
       "items": [
         {{
-          "feature": "Real feature from excerpts (e.g. Microcalcifications, Taller-than-wide). null only if no features mentioned.",
+          "feature": "Real feature from excerpts. null only if no features mentioned.",
           "description": "Clinical significance, specificity/sensitivity if stated in excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
@@ -918,15 +864,9 @@ CONTRACT ADDITIONS:
 }}
 Return ONLY valid JSON:"""
 
-        # ── TIMING ────────────────────────────────────────────────────────────
         elif question_type == "timing":
             return base + f"""
 QUESTION: {question}
-
-CONTRACT ADDITIONS:
-- Use real clinical situations from excerpts. NEVER "Situation" or "Factor name".
-- Include specific size thresholds or criteria if stated in any excerpt.
-- Synthesise timing guidance from all relevant excerpts.
 
 {{
   "overview": "2-3 sentence summary of when and why this is recommended, synthesised from excerpts. [SOURCE_X]. REQUIRED.",
@@ -944,7 +884,7 @@ CONTRACT ADDITIONS:
       "header": "Size and Risk Thresholds",
       "items": [
         {{
-          "category": "Real risk/size category from excerpts (e.g. High Suspicion, Low Suspicion). null only if no thresholds in any excerpt.",
+          "category": "Real risk/size category from excerpts. null only if no thresholds in any excerpt.",
           "threshold": "Specific size or criterion from excerpts. null only if not stated in any excerpt.",
           "recommendation": "What is recommended at this threshold, synthesised from excerpts. [SOURCE_X]. null only if no recommendation content."
         }}
@@ -954,7 +894,7 @@ CONTRACT ADDITIONS:
       "header": "Important Considerations",
       "items": [
         {{
-          "consideration": "Real factor from excerpts (e.g. High-risk history, Nodule growth). null only if no considerations in any excerpt.",
+          "consideration": "Real factor from excerpts. null only if no considerations in any excerpt.",
           "description": "How this factor influences the timing decision, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
@@ -967,15 +907,9 @@ CONTRACT ADDITIONS:
 }}
 Return ONLY valid JSON:"""
 
-        # ── STAGING ───────────────────────────────────────────────────────────
         elif question_type == "staging":
             return base + f"""
 QUESTION: {question}
-
-CONTRACT ADDITIONS:
-- Use exact staging nomenclature from excerpts (T1, T2, N0, M1 etc).
-- Include age-based distinctions if mentioned in any excerpt (e.g. <55 vs ≥55 years).
-- Synthesise staging criteria from all relevant excerpts.
 
 {{
   "overview": "2-3 sentences: staging system, cancer type it applies to, key distinguishing features synthesised from excerpts. [SOURCE_X]. REQUIRED.",
@@ -986,7 +920,7 @@ CONTRACT ADDITIONS:
         {{
           "component": "T, N, or M — synthesised from excerpts.",
           "description": "What this component measures, synthesised from excerpts. [SOURCE_X]. null only if no TNM content in any excerpt.",
-          "categories": "Exact subcategories from excerpts (e.g. T1 <1 cm, T2 1–4 cm). null only if no subcategories stated."
+          "categories": "Exact subcategories from excerpts. null only if no subcategories stated."
         }}
       ]
     }},
@@ -994,10 +928,10 @@ CONTRACT ADDITIONS:
       "header": "Stage Groupings",
       "subgroups": [
         {{
-          "subgroup": "Patient subgroup from excerpts (e.g. Patients <55 years). null only if no groupings in any excerpt.",
+          "subgroup": "Patient subgroup from excerpts. null only if no groupings in any excerpt.",
           "stages": [
             {{
-              "stage": "Stage label from excerpts (e.g. Stage I, Stage IVA). null only if not in any excerpt.",
+              "stage": "Stage label from excerpts. null only if not in any excerpt.",
               "criteria": "TNM criteria synthesised from excerpts. [SOURCE_X]. null only if not stated."
             }}
           ]
@@ -1016,23 +950,16 @@ CONTRACT ADDITIONS:
 }}
 Return ONLY valid JSON:"""
 
-        # ── RISK STRATIFICATION ───────────────────────────────────────────────
         elif question_type == "risk_stratification":
             return base + f"""
 QUESTION: {question}
 
-CONTRACT ADDITIONS:
-- Three parallel tiers REQUIRED: Low, Intermediate, High.
-- Synthesise criteria from all excerpts. If only some tiers are well-covered, synthesise
-  what is available and mark uncovered tiers as null.
-- Include percentage recurrence rates per tier if stated in any excerpt.
-
 {{
-  "overview": "2-3 sentences: stratification system (e.g. ATA 2015), what it predicts, how it guides treatment — synthesised from excerpts. [SOURCE_X]. REQUIRED.",
+  "overview": "2-3 sentences: stratification system, what it predicts, how it guides treatment — synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
     {{
       "header": "Low Risk",
-      "recurrence_rate": "Exact percentage range from excerpts (e.g. <5%). null only if not stated in any excerpt.",
+      "recurrence_rate": "Exact percentage range from excerpts. null only if not stated in any excerpt.",
       "criteria": [
         {{
           "criterion": "Real criterion synthesised from excerpts. null only if no low-risk criteria in any excerpt.",
@@ -1068,15 +995,9 @@ CONTRACT ADDITIONS:
 }}
 Return ONLY valid JSON:"""
 
-        # ── IMPACT ────────────────────────────────────────────────────────────
         elif question_type == "impact":
             return base + f"""
 QUESTION: {question}
-
-CONTRACT ADDITIONS:
-- Organise by impact domain: Management, Prognosis, Surgery, Surveillance.
-- Include specific data (percentages, survival differences) from excerpts where available.
-- Synthesise across all excerpts to populate all domains where possible.
 
 {{
   "overview": "2-3 sentences: how common is this factor, its primary clinical impact, overall significance — synthesised from excerpts. [SOURCE_X]. REQUIRED.",
@@ -1085,7 +1006,7 @@ CONTRACT ADDITIONS:
       "header": "Impact on Management",
       "items": [
         {{
-          "aspect": "Real management aspect from excerpts (e.g. Surgical Approach, RAI Therapy). null only if no management impact in any excerpt.",
+          "aspect": "Real management aspect from excerpts. null only if no management impact in any excerpt.",
           "description": "How this factor changes management, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
@@ -1094,7 +1015,7 @@ CONTRACT ADDITIONS:
       "header": "Impact on Prognosis",
       "items": [
         {{
-          "aspect": "Real prognostic aspect from excerpts (e.g. Recurrence Risk, Overall Survival). null only if no prognostic data in any excerpt.",
+          "aspect": "Real prognostic aspect from excerpts. null only if no prognostic data in any excerpt.",
           "description": "Specific impact with data synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
@@ -1107,7 +1028,7 @@ CONTRACT ADDITIONS:
       "header": "Summary of Impact",
       "table": [
         {{
-          "domain": "Domain from excerpts (e.g. Recurrence, Mortality, Surgery, Surveillance). null only if no domain data.",
+          "domain": "Domain from excerpts. null only if no domain data.",
           "impact": "One-sentence synthesised impact. [SOURCE_X]. null only if no relevant content."
         }}
       ]
@@ -1116,15 +1037,9 @@ CONTRACT ADDITIONS:
 }}
 Return ONLY valid JSON:"""
 
-        # ── SURVEILLANCE ──────────────────────────────────────────────────────
         elif question_type == "surveillance":
             return base + f"""
 QUESTION: {question}
-
-CONTRACT ADDITIONS:
-- Organise by surveillance modality: blood tests, imaging, scans.
-- Use real test names from excerpts. NEVER "Test Name".
-- Synthesise a complete surveillance plan from all relevant excerpts.
 
 {{
   "overview": "2-3 sentences: what surveillance consists of, primary tests, risk-stratified approach — synthesised from excerpts. [SOURCE_X]. REQUIRED.",
@@ -1133,7 +1048,7 @@ CONTRACT ADDITIONS:
       "header": "Key Surveillance Modalities",
       "items": [
         {{
-          "modality": "Real test name from excerpts (e.g. Thyroglobulin Testing, Neck Ultrasound, PET-CT). null only if no modality information in any excerpt.",
+          "modality": "Real test name from excerpts. null only if no modality information in any excerpt.",
           "description": "What it detects, when used, why preferred — synthesised from excerpts. [SOURCE_X]. null only if no relevant content.",
           "frequency": "How often performed if stated in any excerpt. null only if no frequency data."
         }}
@@ -1143,7 +1058,7 @@ CONTRACT ADDITIONS:
       "header": "Surveillance Strategy by Risk Group",
       "items": [
         {{
-          "risk_group": "Real risk group from excerpts (e.g. Low-risk, High-risk). null only if no risk stratification in any excerpt.",
+          "risk_group": "Real risk group from excerpts. null only if no risk stratification in any excerpt.",
           "approach": "Recommended surveillance approach synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
@@ -1156,15 +1071,9 @@ CONTRACT ADDITIONS:
 }}
 Return ONLY valid JSON:"""
 
-        # ── RECURRENCE ────────────────────────────────────────────────────────
         elif question_type == "recurrence":
             return base + f"""
 QUESTION: {question}
-
-CONTRACT ADDITIONS:
-- Organise by: patterns by location, detection methods, risk factors, clinical signs.
-- Use exact location names and percentages from excerpts where available.
-- Synthesise a complete recurrence picture from all relevant excerpts.
 
 {{
   "overview": "2-3 sentences: overall recurrence rate, most common site, primary detection method — synthesised from excerpts. [SOURCE_X]. REQUIRED.",
@@ -1173,7 +1082,7 @@ CONTRACT ADDITIONS:
       "header": "Common Patterns of Recurrence",
       "items": [
         {{
-          "pattern": "Real location from excerpts (e.g. Regional Lymph Nodes, Thyroid Bed, Distant Metastasis). null only if no recurrence patterns in any excerpt.",
+          "pattern": "Real location from excerpts. null only if no recurrence patterns in any excerpt.",
           "description": "Where exactly, percentage of recurrences, synthesised from excerpts. [SOURCE_X]. null only if no relevant content.",
           "frequency": "Percentage from excerpts if stated. null only if not in any excerpt."
         }}
@@ -1183,7 +1092,7 @@ CONTRACT ADDITIONS:
       "header": "Methods of Detection",
       "items": [
         {{
-          "method": "Real detection method from excerpts (e.g. Serum Thyroglobulin, Neck Ultrasound, PET-CT). null only if no detection methods in any excerpt.",
+          "method": "Real detection method from excerpts. null only if no detection methods in any excerpt.",
           "description": "How it detects recurrence, when used — synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
@@ -1192,7 +1101,7 @@ CONTRACT ADDITIONS:
       "header": "Risk Factors for Recurrence",
       "items": [
         {{
-          "factor": "Real risk factor from excerpts (e.g. LN metastasis at diagnosis, BRAF mutation). null only if no risk factors in any excerpt.",
+          "factor": "Real risk factor from excerpts. null only if no risk factors in any excerpt.",
           "description": "Why this increases recurrence risk, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
@@ -1205,15 +1114,9 @@ CONTRACT ADDITIONS:
 }}
 Return ONLY valid JSON:"""
 
-        # ── MOLECULAR ─────────────────────────────────────────────────────────
         elif question_type == "molecular":
             return base + f"""
 QUESTION: {question}
-
-CONTRACT ADDITIONS:
-- Use exact mutation names and prevalence percentages from excerpts.
-- Organise by: mechanism, cancer type association, prognosis, therapeutic implications, testing.
-- Synthesise a complete molecular profile from all relevant excerpts.
 
 {{
   "overview": "2-3 sentences: what this gene/mutation is, how common it is, overall clinical importance — synthesised from excerpts. [SOURCE_X]. REQUIRED.",
@@ -1226,9 +1129,9 @@ CONTRACT ADDITIONS:
       "header": "Prevalence and Cancer Type Association",
       "items": [
         {{
-          "cancer_type": "Real cancer type from excerpts (e.g. Papillary Thyroid Cancer). null only if no type association in any excerpt.",
-          "prevalence": "Exact percentage from excerpts (e.g. 40–70% of PTC). null only if not stated in any excerpt.",
-          "mutation_subtype": "Specific mutation subtype from excerpts (e.g. V600E, M918T). null only if not in any excerpt.",
+          "cancer_type": "Real cancer type from excerpts. null only if no type association in any excerpt.",
+          "prevalence": "Exact percentage from excerpts. null only if not stated in any excerpt.",
+          "mutation_subtype": "Specific mutation subtype from excerpts. null only if not in any excerpt.",
           "description": "Clinical characteristics associated with this mutation, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
@@ -1241,7 +1144,7 @@ CONTRACT ADDITIONS:
       "header": "Therapeutic Implications",
       "items": [
         {{
-          "therapy": "Real targeted therapy from excerpts (e.g. Dabrafenib + Trametinib). null only if no therapy mentioned in any excerpt.",
+          "therapy": "Real targeted therapy from excerpts. null only if no therapy mentioned in any excerpt.",
           "indication": "What mutation this targets, synthesised from excerpts. [SOURCE_X]. null only if no indication content.",
           "outcome": "Key outcome data synthesised from excerpts. [SOURCE_X]. null only if no outcome data."
         }}
@@ -1255,7 +1158,6 @@ CONTRACT ADDITIONS:
 }}
 Return ONLY valid JSON:"""
 
-        # ── FALLBACK ──────────────────────────────────────────────────────────
         else:
             logger.warning(f"Unknown type '{question_type}', falling back to definition")
             return self._create_type_specific_prompt(question, context, "definition")
@@ -1268,22 +1170,30 @@ Return ONLY valid JSON:"""
         self,
         question: str,
         chat_history: Optional[list] = None,
-        k: int = 30
+        k: int = 30,
     ) -> Dict[str, Any]:
         """
         Full pipeline:
-          1. Classify → 2. Expand → 3. Retrieve → 4. Deduplicate →
-          5. Rerank → 6. Build context → 7. Confidence → 8. Answer → 9. Faithfulness
+          1.  Classify
+          2.  Expand queries
+          3.  Bi-encoder retrieval
+          4.  Deduplicate
+          5.  Cross-encoder reranking
+          6.  Build tagged context
+          7.  Compute evidence confidence
+          8.  Generate JSON answer
+          9.  Faithfulness evaluation
+          10. Credibility scorecard (all 7 metrics)
         """
-        # 1. Classify
+        # 1
         question_type = self._classify_question_type(question)
 
-        # 2. Expand
+        # 2
         sub_queries = self._expand_query_with_llm(question)
 
-        # 3. Retrieve
+        # 3
         logger.info("=== FIRST STAGE: Bi-encoder retrieval ===")
-        all_retrieved = []
+        all_retrieved    = []
         chunks_per_query = FIRST_STAGE_RETRIEVAL // len(sub_queries)
         for idx, sub_query in enumerate(sub_queries, 1):
             logger.info(f"Sub-query {idx}/{len(sub_queries)}: {sub_query}")
@@ -1291,29 +1201,29 @@ Return ONLY valid JSON:"""
             all_retrieved.extend(retrieved)
         logger.info(f"First stage: {len(all_retrieved)} chunks")
 
-        # 4. Deduplicate
+        # 4
         unique_retrieved = self._deduplicate_chunks(all_retrieved)
         if not unique_retrieved:
             return {
-                "error": "No relevant information found",
+                "error":      "No relevant information found",
                 "json_response": None,
-                "sources": {},
-                "confidence": {"label": "Low", "score": 0, "breakdown": "No data"}
+                "sources":    {},
+                "confidence": {"label": "Low", "score": 0, "breakdown": "No data"},
             }
 
-        # 5. Rerank
+        # 5
         logger.info("=== SECOND STAGE: Cross-encoder re-ranking ===")
         reranked_chunks = self._rerank_with_cross_encoder(
             question=question, chunks=unique_retrieved, top_k=SECOND_STAGE_TOP_K
         )
 
-        # 6. Context
+        # 6
         context, source_map = self._build_tagged_context(reranked_chunks)
 
-        # 7. Confidence
+        # 7
         confidence = self._compute_confidence(reranked_chunks)
 
-        # 8. Generate answer
+        # 8
         logger.info(f"Generating '{question_type}' answer...")
         prompt = self._create_type_specific_prompt(question, context, question_type)
         try:
@@ -1323,40 +1233,70 @@ Return ONLY valid JSON:"""
                 response = re.sub(r'\n?```\s*$', '', response)
             json_response = json.loads(response)
 
-            # 9. Faithfulness
+            # 9 — Faithfulness
             logger.info("Evaluating faithfulness...")
             try:
                 faithfulness = self.faithfulness_evaluator.evaluate(
                     json_response=json_response,
                     tagged_context=context,
-                    source_map=source_map
+                    source_map=source_map,
                 )
-                logger.info(f"Faithfulness: {faithfulness.get('label','N/A')} ({faithfulness.get('score','N/A')})")
+                logger.info(
+                    f"Faithfulness: {faithfulness.get('label','N/A')} "
+                    f"({faithfulness.get('score','N/A')})"
+                )
             except Exception as e:
                 logger.error(f"Faithfulness evaluation failed: {e}", exc_info=True)
                 faithfulness = {
                     "score": None, "label": "Not Available",
-                    "error": str(e), "total_statements": 0, "evaluated_statements": 0
+                    "error": str(e), "total_statements": 0, "evaluated_statements": 0,
+                }
+
+            # Partial result so credibility evaluator can read it
+            partial_result = {
+                "json_response":   json_response,
+                "sources":         source_map,
+                "confidence":      confidence,
+                "faithfulness":    faithfulness,
+                "question_type":   question_type,
+                "retrieval_stats": {
+                    "first_stage_retrieved": len(all_retrieved),
+                    "after_dedup":           len(unique_retrieved),
+                    "after_reranking":       len(reranked_chunks),
+                },
+            }
+
+            # 10 — Credibility scorecard (all 7 metrics)
+            logger.info("Computing credibility scorecard (all 7 metrics)...")
+            try:
+                credibility_scorecard = self.credibility_evaluator.compute_scorecard(
+                    question=question,
+                    result=partial_result,
+                    run_consistency=True,
+                    unanswerable_questions=self.credibility_evaluator.unanswerable_cache,
+                )
+                logger.info(
+                    f"Credibility score: {credibility_scorecard.get('total_score','N/A')}/100 "
+                    f"({credibility_scorecard.get('overall_label','N/A')})"
+                )
+            except Exception as e:
+                logger.error(f"Credibility scorecard failed: {e}", exc_info=True)
+                credibility_scorecard = {
+                    "error":         str(e),
+                    "total_score":   None,
+                    "overall_label": "Not Available",
                 }
 
             return {
-                "json_response": json_response,
-                "sources": source_map,
-                "confidence": confidence,
-                "faithfulness": faithfulness,
-                "question_type": question_type,
-                "retrieval_stats": {
-                    "first_stage_retrieved": len(all_retrieved),
-                    "after_dedup": len(unique_retrieved),
-                    "after_reranking": len(reranked_chunks),
-                }
+                **partial_result,
+                "credibility_scorecard": credibility_scorecard,
             }
 
         except json.JSONDecodeError as e:
             logger.error(f"JSON parse failed: {e}\nResponse was: {response}")
             return {
-                "error": f"Failed to generate structured response: {str(e)}",
+                "error":         f"Failed to generate structured response: {str(e)}",
                 "json_response": None,
-                "sources": source_map,
-                "confidence": confidence
+                "sources":       source_map,
+                "confidence":    confidence,
             }
