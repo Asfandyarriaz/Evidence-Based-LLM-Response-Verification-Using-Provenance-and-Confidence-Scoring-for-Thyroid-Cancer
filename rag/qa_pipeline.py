@@ -29,11 +29,11 @@ EVIDENCE_LEVEL_WEIGHTS: Dict[int, Tuple[str, float]] = {
     7: ("Case Reports / Series", 0.40),
 }
 
-FIRST_STAGE_RETRIEVAL  = 100
-SECOND_STAGE_TOP_K     = 20
-MAX_SOURCES            = 10
-MAX_CHUNKS_PER_SOURCE  = 3
-MAX_EXCERPT_CHARS      = 1200
+FIRST_STAGE_RETRIEVAL   = 100
+SECOND_STAGE_TOP_K      = 20
+MAX_SOURCES             = 10
+MAX_CHUNKS_PER_SOURCE   = 3
+MAX_EXCERPT_CHARS       = 1200
 MAX_TOTAL_CONTEXT_CHARS = 10000
 
 
@@ -63,19 +63,13 @@ class QAPipeline:
         logger.info("Faithfulness evaluator initialized")
 
         logger.info("Initializing credibility evaluator")
-        self.credibility_evaluator = CredibilityEvaluator(
-            pipeline=self,
-            llm=self.llm,
-        )
+        self.credibility_evaluator = CredibilityEvaluator(pipeline=self, llm=self.llm)
+        # Populated once at app startup by app.py
+        self.credibility_evaluator.unanswerable_cache = None
         logger.info("Credibility evaluator initialized")
 
-        # Unanswerable questions for M5 — populated once at app startup
-        # via pipeline.credibility_evaluator.unanswerable_cache
-        # Set by app.py after init: pipeline.credibility_evaluator.unanswerable_cache = [...]
-        self.credibility_evaluator.unanswerable_cache: Optional[List[str]] = None
-
     # =========================================================================
-    # CLASSIFICATION
+    # CLASSIFICATION — Three-layer defence
     # =========================================================================
 
     def _classify_question_type(self, question: str) -> str:
@@ -280,6 +274,7 @@ Return ONLY the category name (one word), nothing else:"""
             "how effective is", "what studies", "clinical evidence", "trial data",
         ]
         if any(phrase in q for phrase in strong_phrases):
+            logger.info(f"Reclassifying '{question}' → evidence (strong phrase)")
             return "evidence"
         weak = [
             "evidence", "trial", "study", "studies", "research", "efficacy",
@@ -288,6 +283,7 @@ Return ONLY the category name (one word), nothing else:"""
             "phase 3", "phase 2", "rct",
         ]
         if sum(1 for w in weak if w in q) >= 2:
+            logger.info(f"Reclassifying '{question}' → evidence (multiple weak indicators)")
             return "evidence"
         return original_category
 
@@ -301,8 +297,10 @@ Return ONLY the category name (one word), nothing else:"""
         mentions_gene    = any(gene in q for gene in genes)
         mentions_context = any(ctx in q for ctx in molecular_context)
         if mentions_gene and mentions_context:
+            logger.info(f"Reclassifying '{question}' → molecular")
             return "molecular"
         if mentions_gene and any(w in q for w in ["role", "relate", "what is", "how does"]):
+            logger.info(f"Reclassifying '{question}' → molecular (gene + role)")
             return "molecular"
         return original_category
 
@@ -339,9 +337,9 @@ Return ONLY the category name (one word), nothing else:"""
         logger.info("=== DIAGNOSTIC MODE ===")
         sub_queries = self._expand_query_with_llm(question)
         diagnosis   = {
-            "original_question":    question,
+            "original_question":     question,
             "sub_queries_generated": sub_queries,
-            "retrieval_results":    [],
+            "retrieval_results":     [],
         }
         for idx, sub_query in enumerate(sub_queries, 1):
             chunks = self.vector_store.search(sub_query, k=k)
@@ -393,7 +391,6 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
     def _add_fallback_queries(self, original_question: str, existing_queries: List[str]) -> List[str]:
         q          = original_question.lower()
         additional = []
-
         if any(w in q for w in ["evidence", "trial", "efficacy", "outcome", "study", "data", "effective"]):
             topic = self._extract_topic(original_question) or "thyroid cancer treatment"
             additional.extend([
@@ -427,14 +424,12 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
                 "RET mutation medullary thyroid cancer targeted therapy",
                 "molecular targeted therapy thyroid cancer",
             ])
-
         if any(term in q for term in ["radioactive iodine", "rai", "i-131", "radioiodine"]):
             additional.extend([
                 "salivary gland dysfunction radioactive iodine",
                 "xerostomia RAI therapy",
                 "secondary malignancy radioiodine",
             ])
-
         for query in additional:
             if query not in existing_queries:
                 existing_queries.append(query)
@@ -458,14 +453,9 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
         queries = [question]
         if any(w in q for w in ["complication", "risk", "adverse", "side effect"]):
             topic = self._extract_topic(question) or "thyroid cancer treatment"
-            queries.extend([
-                f"complications {topic}", f"adverse effects {topic}", f"toxicity {topic}",
-            ])
+            queries.extend([f"complications {topic}", f"adverse effects {topic}", f"toxicity {topic}"])
         elif any(w in q for w in ["surgical", "surgery", "procedure", "operation"]):
-            queries.extend([
-                f"{question.replace('?','')} complications",
-                f"{question.replace('?','')} risks",
-            ])
+            queries.extend([f"{question.replace('?','')} complications", f"{question.replace('?','')} risks"])
         return queries
 
     def _deduplicate_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -479,15 +469,13 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
         logger.info(f"Deduplicated {len(chunks)} → {len(unique)} chunks")
         return unique
 
-    def _build_tagged_context(
-        self, retrieved: List[Dict[str, Any]]
-    ) -> Tuple[str, Dict[str, Dict]]:
+    def _build_tagged_context(self, retrieved: List[Dict[str, Any]]) -> Tuple[str, Dict[str, Dict]]:
         grouped: Dict[str, List[Dict[str, Any]]] = {}
         for r in retrieved:
             key = str(r.get("pmid") or r.get("title"))
             grouped.setdefault(key, []).append(r)
 
-        source_map  = {}
+        source_map   = {}
         tagged_parts = []
         total_chars  = 0
         source_id    = 1
@@ -518,16 +506,13 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
         return context, source_map
 
     def _compute_confidence(self, retrieved: List[Dict[str, Any]]) -> Dict[str, Any]:
-        levels = [
-            r.get("evidence_level") for r in retrieved
-            if r.get("evidence_level") in EVIDENCE_LEVEL_WEIGHTS
-        ]
+        levels = [r.get("evidence_level") for r in retrieved if r.get("evidence_level") in EVIDENCE_LEVEL_WEIGHTS]
         if not levels:
             return {"label": "Low", "score": 0, "breakdown": "No evidence metadata"}
-        weights    = [EVIDENCE_LEVEL_WEIGHTS[l][1] for l in levels]
-        score      = int(round((sum(weights) / len(weights)) * 100))
-        label      = "High" if score >= 85 else "Medium" if score >= 65 else "Low"
-        breakdown  = "; ".join(
+        weights   = [EVIDENCE_LEVEL_WEIGHTS[l][1] for l in levels]
+        score     = int(round((sum(weights) / len(weights)) * 100))
+        label     = "High" if score >= 85 else "Medium" if score >= 65 else "Low"
+        breakdown = "; ".join(
             f"Level {l} ({EVIDENCE_LEVEL_WEIGHTS[l][0]}): {levels.count(l)}"
             for l in sorted(set(levels))
         )
@@ -538,6 +523,11 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
     # =========================================================================
 
     def _create_type_specific_prompt(self, question: str, context: str, question_type: str) -> str:
+        """
+        Synthesis mode: LLM synthesises from excerpts, never collapses to null
+        unless the topic is genuinely absent from all excerpts. Every claim
+        carries a [SOURCE_X] tag for traceability.
+        """
         base = f"""
 {self.instructions}
 
@@ -575,13 +565,6 @@ CONTEXT WITH SOURCE TAGS:
 QUESTION: {question}
 
 Synthesise evidence across all sources. Organise by cancer subtype, not by source.
-Extract trial names and numerical outcomes from the excerpts wherever they appear.
-
-CONTRACT ADDITIONS:
-- Drug items MUST include trial name + numerical outcome if present in any excerpt.
-- Key Considerations section REQUIRED, minimum 2 items synthesised from excerpts.
-- Items arrays must remain arrays even with one item.
-- If only partial trial data exists in excerpts, synthesise what is there and cite it.
 
 {{
   "overview": "2-3 sentences on TKI role, approval status, overall evidence quality synthesised from excerpts. [SOURCE_X]. REQUIRED — never null.",
@@ -601,7 +584,7 @@ CONTRACT ADDITIONS:
       "items": [
         {{
           "name": "Exact drug name from excerpts. null if no MTC drug appears in any excerpt.",
-          "description": "Trial name + endpoint numbers if available; otherwise synthesise available MTC evidence from excerpts. [SOURCE_X]. null only if no MTC evidence exists.",
+          "description": "Trial name + endpoint numbers if available; otherwise synthesise available MTC evidence. [SOURCE_X]. null only if no MTC evidence exists.",
           "highlight": "Clinical positioning synthesised from excerpts. [SOURCE_X]. null only if no relevant MTC content."
         }}
       ]
@@ -619,22 +602,10 @@ CONTRACT ADDITIONS:
     {{
       "header": "Key Considerations",
       "items": [
-        {{
-          "consideration": "Toxicity Profile",
-          "description": "Synthesise adverse event information from excerpts, including percentages if stated. [SOURCE_X]. null only if no toxicity data in any excerpt."
-        }},
-        {{
-          "consideration": "Resistance",
-          "description": "Synthesise any resistance or salvage information from excerpts. [SOURCE_X]. null only if excerpts contain nothing on resistance."
-        }},
-        {{
-          "consideration": "Patient Selection",
-          "description": "Synthesise patient selection criteria from excerpts (e.g. radioiodine-refractory, progressive disease). [SOURCE_X]. null only if no selection data in excerpts."
-        }},
-        {{
-          "consideration": "Treatment Sequencing",
-          "description": "Synthesise sequencing guidance from excerpts. [SOURCE_X]. null only if no sequencing information in any excerpt."
-        }}
+        {{"consideration": "Toxicity Profile", "description": "Synthesise adverse event information from excerpts, including percentages if stated. [SOURCE_X]. null only if no toxicity data in any excerpt."}},
+        {{"consideration": "Resistance", "description": "Synthesise any resistance or salvage information from excerpts. [SOURCE_X]. null only if excerpts contain nothing on resistance."}},
+        {{"consideration": "Patient Selection", "description": "Synthesise patient selection criteria from excerpts. [SOURCE_X]. null only if no selection data in excerpts."}},
+        {{"consideration": "Treatment Sequencing", "description": "Synthesise sequencing guidance from excerpts. [SOURCE_X]. null only if no sequencing information in any excerpt."}}
       ]
     }}
   ]
@@ -665,15 +636,12 @@ excerpts are narrow or specialist, combine them to construct a coherent overview
       "header": "Key Characteristics",
       "items": [
         {{
-          "aspect": "Real aspect synthesised from excerpts. null only if excerpts contain no characteristic information.",
+          "aspect": "Real aspect synthesised from excerpts (e.g. Growth pattern, Prevalence, Histology). null only if excerpts contain no characteristic information.",
           "description": "Explanation synthesised from excerpts. [SOURCE_X]. null only if no relevant excerpt content."
         }}
       ]
     }},
-    {{
-      "header": "Causes and Risk Factors",
-      "content": "Paragraph synthesising causes and risk factors from excerpts. [SOURCE_X]. null only if no excerpt mentions any cause or risk factor."
-    }},
+    {{"header": "Causes and Risk Factors", "content": "Paragraph synthesising causes and risk factors from excerpts. [SOURCE_X]. null only if no excerpt mentions any cause or risk factor."}},
     {{
       "header": "Common Symptoms",
       "items": [
@@ -683,10 +651,7 @@ excerpts are narrow or specialist, combine them to construct a coherent overview
         }}
       ]
     }},
-    {{
-      "header": "Diagnosis and Treatment",
-      "content": "Diagnostic and treatment approach synthesised from excerpts. [SOURCE_X]. null only if no diagnostic or treatment content in any excerpt."
-    }}
+    {{"header": "Diagnosis and Treatment", "content": "Diagnostic and treatment approach synthesised from excerpts. [SOURCE_X]. null only if no diagnostic or treatment content in any excerpt."}}
   ]
 }}
 Return ONLY valid JSON:"""
@@ -726,10 +691,7 @@ QUESTION: {question}
         }}
       ]
     }},
-    {{
-      "header": "Management and Prevention",
-      "content": "Managing or preventing complications, synthesised from excerpts. [SOURCE_X]. null only if no management content in any excerpt."
-    }}
+    {{"header": "Management and Prevention", "content": "Managing or preventing complications, synthesised from excerpts. [SOURCE_X]. null only if no management content in any excerpt."}}
   ]
 }}
 Return ONLY valid JSON:"""
@@ -755,31 +717,14 @@ QUESTION: {question}
     }},
     {{
       "header": "Characteristics of First Option",
-      "items": [
-        {{
-          "aspect": "Real characteristic from excerpts. null only if no characteristics mentioned.",
-          "description": "Synthesised explanation. [SOURCE_X]. null only if no relevant excerpt."
-        }}
-      ]
+      "items": [{{"aspect": "Real characteristic from excerpts. null only if none.", "description": "Synthesised explanation. [SOURCE_X]. null only if no relevant excerpt."}}]
     }},
     {{
       "header": "Management Steps",
-      "steps": [
-        {{
-          "step": 1,
-          "title": "Real step title synthesised from excerpts. null only if no steps mentioned.",
-          "description": "What this step involves, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
-        }}
-      ]
+      "steps": [{{"step": 1, "title": "Real step title from excerpts. null only if no steps mentioned.", "description": "What this step involves, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."}}]
     }},
-    {{
-      "header": "Shared Characteristics",
-      "content": "What both options have in common, synthesised from excerpts. [SOURCE_X]. null only if no shared features mentioned."
-    }},
-    {{
-      "header": "Clinical Outcomes",
-      "content": "Comparing survival, response rates with numbers if available, synthesised from excerpts. [SOURCE_X]. null only if no outcome data in any excerpt."
-    }}
+    {{"header": "Shared Characteristics", "content": "What both options have in common, synthesised from excerpts. [SOURCE_X]. null only if no shared features mentioned."}},
+    {{"header": "Clinical Outcomes", "content": "Comparing survival, response rates with numbers if available, synthesised from excerpts. [SOURCE_X]. null only if no outcome data."}}
   ]
 }}
 Return ONLY valid JSON:"""
@@ -803,25 +748,12 @@ QUESTION: {question}
     }},
     {{
       "header": "Second-Line and Salvage Treatments",
-      "items": [
-        {{
-          "treatment": "Real treatment name from excerpts. null only if no second-line treatment mentioned.",
-          "description": "When used, outcomes, trial data synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
-        }}
-      ]
+      "items": [{{"treatment": "Real treatment name from excerpts. null only if none mentioned.", "description": "When used, outcomes, trial data synthesised from excerpts. [SOURCE_X]. null only if no relevant content."}}]
     }},
-    {{
-      "header": "Treatment by Cancer Subtype",
-      "content": "Mapping approved agents to DTC, MTC, ATC subtypes, synthesised from excerpts. [SOURCE_X]. null only if no subtype-treatment mapping in any excerpt."
-    }},
+    {{"header": "Treatment by Cancer Subtype", "content": "Mapping approved agents to DTC, MTC, ATC subtypes, synthesised from excerpts. [SOURCE_X]. null only if no subtype-treatment mapping."}},
     {{
       "header": "Key Considerations",
-      "items": [
-        {{
-          "consideration": "Real consideration from excerpts. null only if no considerations mentioned.",
-          "description": "Concise synthesised explanation with any data. [SOURCE_X]. null only if no relevant content."
-        }}
-      ]
+      "items": [{{"consideration": "Real consideration from excerpts. null only if none mentioned.", "description": "Concise synthesised explanation with any data. [SOURCE_X]. null only if no relevant content."}}]
     }}
   ]
 }}
@@ -836,30 +768,14 @@ QUESTION: {question}
   "sections": [
     {{
       "header": "Key Roles",
-      "items": [
-        {{
-          "role": "Real role from excerpts. null only if no role information in any excerpt.",
-          "description": "What this role involves and its clinical value, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
-        }}
-      ]
+      "items": [{{"role": "Real role from excerpts. null only if no role information in any excerpt.", "description": "What this role involves and its clinical value, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."}}]
     }},
     {{
       "header": "Key Diagnostic Features or Findings",
-      "items": [
-        {{
-          "feature": "Real feature from excerpts. null only if no features mentioned.",
-          "description": "Clinical significance, specificity/sensitivity if stated in excerpts. [SOURCE_X]. null only if no relevant content."
-        }}
-      ]
+      "items": [{{"feature": "Real feature from excerpts. null only if no features mentioned.", "description": "Clinical significance, specificity/sensitivity if stated in excerpts. [SOURCE_X]. null only if no relevant content."}}]
     }},
-    {{
-      "header": "Diagnostic Pathway",
-      "content": "Step-by-step process from presentation to diagnosis, synthesised from excerpts. [SOURCE_X]. null only if no pathway information in any excerpt."
-    }},
-    {{
-      "header": "Limitations and Considerations",
-      "content": "Known limitations of the diagnostic approach, synthesised from excerpts. [SOURCE_X]. null only if no limitations mentioned in any excerpt."
-    }}
+    {{"header": "Diagnostic Pathway", "content": "Step-by-step process from presentation to diagnosis, synthesised from excerpts. [SOURCE_X]. null only if no pathway information in any excerpt."}},
+    {{"header": "Limitations and Considerations", "content": "Known limitations of the diagnostic approach, synthesised from excerpts. [SOURCE_X]. null only if no limitations mentioned."}}
   ]
 }}
 Return ONLY valid JSON:"""
@@ -873,36 +789,23 @@ QUESTION: {question}
   "sections": [
     {{
       "header": "Key Indications",
-      "items": [
-        {{
-          "indication": "Real clinical situation from excerpts. null only if no indications in any excerpt.",
-          "explanation": "Why this timing is recommended, with supporting data synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
-        }}
-      ]
+      "items": [{{"indication": "Real clinical situation from excerpts. null only if no indications in any excerpt.", "explanation": "Why this timing is recommended, with supporting data synthesised from excerpts. [SOURCE_X]. null only if no relevant content."}}]
     }},
     {{
       "header": "Size and Risk Thresholds",
       "items": [
         {{
           "category": "Real risk/size category from excerpts. null only if no thresholds in any excerpt.",
-          "threshold": "Specific size or criterion from excerpts. null only if not stated in any excerpt.",
+          "threshold": "Specific size or criterion from excerpts. null only if not stated.",
           "recommendation": "What is recommended at this threshold, synthesised from excerpts. [SOURCE_X]. null only if no recommendation content."
         }}
       ]
     }},
     {{
       "header": "Important Considerations",
-      "items": [
-        {{
-          "consideration": "Real factor from excerpts. null only if no considerations in any excerpt.",
-          "description": "How this factor influences the timing decision, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
-        }}
-      ]
+      "items": [{{"consideration": "Real factor from excerpts. null only if no considerations in any excerpt.", "description": "How this factor influences the timing decision, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."}}]
     }},
-    {{
-      "header": "Contraindications or When Not Recommended",
-      "content": "Situations where this should be avoided, synthesised from excerpts. [SOURCE_X]. null only if no contraindication information in any excerpt."
-    }}
+    {{"header": "Contraindications or When Not Recommended", "content": "Situations where this should be avoided, synthesised from excerpts. [SOURCE_X]. null only if no contraindication information."}}
   ]
 }}
 Return ONLY valid JSON:"""
@@ -920,7 +823,7 @@ QUESTION: {question}
         {{
           "component": "T, N, or M — synthesised from excerpts.",
           "description": "What this component measures, synthesised from excerpts. [SOURCE_X]. null only if no TNM content in any excerpt.",
-          "categories": "Exact subcategories from excerpts. null only if no subcategories stated."
+          "categories": "Exact subcategories from excerpts (e.g. T1 <1 cm, T2 1-4 cm). null only if no subcategories stated."
         }}
       ]
     }},
@@ -928,24 +831,13 @@ QUESTION: {question}
       "header": "Stage Groupings",
       "subgroups": [
         {{
-          "subgroup": "Patient subgroup from excerpts. null only if no groupings in any excerpt.",
-          "stages": [
-            {{
-              "stage": "Stage label from excerpts. null only if not in any excerpt.",
-              "criteria": "TNM criteria synthesised from excerpts. [SOURCE_X]. null only if not stated."
-            }}
-          ]
+          "subgroup": "Patient subgroup from excerpts (e.g. Patients <55 years). null only if no groupings in any excerpt.",
+          "stages": [{{"stage": "Stage label from excerpts. null only if not in any excerpt.", "criteria": "TNM criteria synthesised from excerpts. [SOURCE_X]. null only if not stated."}}]
         }}
       ]
     }},
-    {{
-      "header": "Clinical vs Pathologic Staging",
-      "content": "cTNM vs pTNM distinction if mentioned in excerpts. [SOURCE_X]. null only if not addressed in any excerpt."
-    }},
-    {{
-      "header": "Key Considerations",
-      "content": "Important caveats or clinical implications synthesised from excerpts. [SOURCE_X]. null only if no such content in any excerpt."
-    }}
+    {{"header": "Clinical vs Pathologic Staging", "content": "cTNM vs pTNM distinction if mentioned in excerpts. [SOURCE_X]. null only if not addressed."}},
+    {{"header": "Key Considerations", "content": "Important caveats or clinical implications synthesised from excerpts. [SOURCE_X]. null only if no such content."}}
   ]
 }}
 Return ONLY valid JSON:"""
@@ -955,42 +847,24 @@ Return ONLY valid JSON:"""
 QUESTION: {question}
 
 {{
-  "overview": "2-3 sentences: stratification system, what it predicts, how it guides treatment — synthesised from excerpts. [SOURCE_X]. REQUIRED.",
+  "overview": "2-3 sentences: stratification system (e.g. ATA 2015), what it predicts, how it guides treatment — synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
     {{
       "header": "Low Risk",
-      "recurrence_rate": "Exact percentage range from excerpts. null only if not stated in any excerpt.",
-      "criteria": [
-        {{
-          "criterion": "Real criterion synthesised from excerpts. null only if no low-risk criteria in any excerpt.",
-          "detail": "Clarification synthesised from excerpts. [SOURCE_X]. null only if no supporting detail."
-        }}
-      ]
+      "recurrence_rate": "Exact percentage range from excerpts (e.g. <5%). null only if not stated.",
+      "criteria": [{{"criterion": "Real criterion synthesised from excerpts. null only if no low-risk criteria.", "detail": "Clarification synthesised from excerpts. [SOURCE_X]. null only if no supporting detail."}}]
     }},
     {{
       "header": "Intermediate Risk",
       "recurrence_rate": "Exact percentage range from excerpts. null only if not stated.",
-      "criteria": [
-        {{
-          "criterion": "Real criterion synthesised from excerpts. null only if no intermediate criteria in any excerpt.",
-          "detail": "Clarification synthesised from excerpts. [SOURCE_X]. null only if no supporting detail."
-        }}
-      ]
+      "criteria": [{{"criterion": "Real criterion synthesised from excerpts. null only if no intermediate criteria.", "detail": "Clarification synthesised from excerpts. [SOURCE_X]. null only if no supporting detail."}}]
     }},
     {{
       "header": "High Risk",
       "recurrence_rate": "Exact percentage range from excerpts. null only if not stated.",
-      "criteria": [
-        {{
-          "criterion": "Real criterion synthesised from excerpts. null only if no high-risk criteria in any excerpt.",
-          "detail": "Clarification synthesised from excerpts. [SOURCE_X]. null only if no supporting detail."
-        }}
-      ]
+      "criteria": [{{"criterion": "Real criterion synthesised from excerpts. null only if no high-risk criteria.", "detail": "Clarification synthesised from excerpts. [SOURCE_X]. null only if no supporting detail."}}]
     }},
-    {{
-      "header": "Dynamic Risk Restratification",
-      "content": "How risk category can change based on treatment response, synthesised from excerpts. [SOURCE_X]. null only if not addressed in any excerpt."
-    }}
+    {{"header": "Dynamic Risk Restratification", "content": "How risk category can change based on treatment response, synthesised from excerpts. [SOURCE_X]. null only if not addressed."}}
   ]
 }}
 Return ONLY valid JSON:"""
@@ -1004,34 +878,16 @@ QUESTION: {question}
   "sections": [
     {{
       "header": "Impact on Management",
-      "items": [
-        {{
-          "aspect": "Real management aspect from excerpts. null only if no management impact in any excerpt.",
-          "description": "How this factor changes management, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
-        }}
-      ]
+      "items": [{{"aspect": "Real management aspect from excerpts. null only if no management impact.", "description": "How this factor changes management, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."}}]
     }},
     {{
       "header": "Impact on Prognosis",
-      "items": [
-        {{
-          "aspect": "Real prognostic aspect from excerpts. null only if no prognostic data in any excerpt.",
-          "description": "Specific impact with data synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
-        }}
-      ]
+      "items": [{{"aspect": "Real prognostic aspect from excerpts. null only if no prognostic data.", "description": "Specific impact with data synthesised from excerpts. [SOURCE_X]. null only if no relevant content."}}]
     }},
-    {{
-      "header": "Age-Related Differences",
-      "content": "How impact differs by patient age, synthesised from excerpts. [SOURCE_X]. null only if no age-related content in any excerpt."
-    }},
+    {{"header": "Age-Related Differences", "content": "How impact differs by patient age, synthesised from excerpts. [SOURCE_X]. null only if no age-related content."}},
     {{
       "header": "Summary of Impact",
-      "table": [
-        {{
-          "domain": "Domain from excerpts. null only if no domain data.",
-          "impact": "One-sentence synthesised impact. [SOURCE_X]. null only if no relevant content."
-        }}
-      ]
+      "table": [{{"domain": "Domain from excerpts (e.g. Recurrence, Mortality). null only if no domain data.", "impact": "One-sentence synthesised impact. [SOURCE_X]. null only if no relevant content."}}]
     }}
   ]
 }}
@@ -1048,7 +904,7 @@ QUESTION: {question}
       "header": "Key Surveillance Modalities",
       "items": [
         {{
-          "modality": "Real test name from excerpts. null only if no modality information in any excerpt.",
+          "modality": "Real test name from excerpts (e.g. Thyroglobulin Testing, Neck Ultrasound, PET-CT). null only if no modality information.",
           "description": "What it detects, when used, why preferred — synthesised from excerpts. [SOURCE_X]. null only if no relevant content.",
           "frequency": "How often performed if stated in any excerpt. null only if no frequency data."
         }}
@@ -1056,17 +912,9 @@ QUESTION: {question}
     }},
     {{
       "header": "Surveillance Strategy by Risk Group",
-      "items": [
-        {{
-          "risk_group": "Real risk group from excerpts. null only if no risk stratification in any excerpt.",
-          "approach": "Recommended surveillance approach synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
-        }}
-      ]
+      "items": [{{"risk_group": "Real risk group from excerpts. null only if no risk stratification.", "approach": "Recommended surveillance approach synthesised from excerpts. [SOURCE_X]. null only if no relevant content."}}]
     }},
-    {{
-      "header": "Special Considerations",
-      "content": "Tg antibody interference, stimulated Tg testing, or other nuances synthesised from excerpts. [SOURCE_X]. null only if no special considerations in any excerpt."
-    }}
+    {{"header": "Special Considerations", "content": "Tg antibody interference, stimulated Tg testing, or other nuances synthesised from excerpts. [SOURCE_X]. null only if no special considerations."}}
   ]
 }}
 Return ONLY valid JSON:"""
@@ -1082,7 +930,7 @@ QUESTION: {question}
       "header": "Common Patterns of Recurrence",
       "items": [
         {{
-          "pattern": "Real location from excerpts. null only if no recurrence patterns in any excerpt.",
+          "pattern": "Real location from excerpts (e.g. Regional Lymph Nodes, Thyroid Bed). null only if no recurrence patterns.",
           "description": "Where exactly, percentage of recurrences, synthesised from excerpts. [SOURCE_X]. null only if no relevant content.",
           "frequency": "Percentage from excerpts if stated. null only if not in any excerpt."
         }}
@@ -1090,26 +938,13 @@ QUESTION: {question}
     }},
     {{
       "header": "Methods of Detection",
-      "items": [
-        {{
-          "method": "Real detection method from excerpts. null only if no detection methods in any excerpt.",
-          "description": "How it detects recurrence, when used — synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
-        }}
-      ]
+      "items": [{{"method": "Real detection method from excerpts. null only if no detection methods.", "description": "How it detects recurrence, when used — synthesised from excerpts. [SOURCE_X]. null only if no relevant content."}}]
     }},
     {{
       "header": "Risk Factors for Recurrence",
-      "items": [
-        {{
-          "factor": "Real risk factor from excerpts. null only if no risk factors in any excerpt.",
-          "description": "Why this increases recurrence risk, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
-        }}
-      ]
+      "items": [{{"factor": "Real risk factor from excerpts. null only if no risk factors.", "description": "Why this increases recurrence risk, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."}}]
     }},
-    {{
-      "header": "Clinical Signs of Recurrence",
-      "content": "Symptoms or signs of recurrence synthesised from excerpts. [SOURCE_X]. null only if no clinical signs in any excerpt."
-    }}
+    {{"header": "Clinical Signs of Recurrence", "content": "Symptoms or signs of recurrence synthesised from excerpts. [SOURCE_X]. null only if no clinical signs."}}
   ]
 }}
 Return ONLY valid JSON:"""
@@ -1121,39 +956,30 @@ QUESTION: {question}
 {{
   "overview": "2-3 sentences: what this gene/mutation is, how common it is, overall clinical importance — synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
-    {{
-      "header": "Mechanism of Action",
-      "content": "How this mutation drives cancer growth and which pathway it activates, synthesised from excerpts. [SOURCE_X]. null only if no mechanism information in any excerpt."
-    }},
+    {{"header": "Mechanism of Action", "content": "How this mutation drives cancer growth and which pathway it activates, synthesised from excerpts. [SOURCE_X]. null only if no mechanism information."}},
     {{
       "header": "Prevalence and Cancer Type Association",
       "items": [
         {{
-          "cancer_type": "Real cancer type from excerpts. null only if no type association in any excerpt.",
-          "prevalence": "Exact percentage from excerpts. null only if not stated in any excerpt.",
+          "cancer_type": "Real cancer type from excerpts. null only if no type association.",
+          "prevalence": "Exact percentage from excerpts. null only if not stated.",
           "mutation_subtype": "Specific mutation subtype from excerpts. null only if not in any excerpt.",
           "description": "Clinical characteristics associated with this mutation, synthesised from excerpts. [SOURCE_X]. null only if no relevant content."
         }}
       ]
     }},
-    {{
-      "header": "Prognostic Significance",
-      "content": "Whether mutation predicts aggressive behaviour, recurrence, or survival — synthesised from excerpts. [SOURCE_X]. null only if no prognostic data in any excerpt."
-    }},
+    {{"header": "Prognostic Significance", "content": "Whether mutation predicts aggressive behaviour, recurrence, or survival — synthesised from excerpts. [SOURCE_X]. null only if no prognostic data."}},
     {{
       "header": "Therapeutic Implications",
       "items": [
         {{
-          "therapy": "Real targeted therapy from excerpts. null only if no therapy mentioned in any excerpt.",
+          "therapy": "Real targeted therapy from excerpts. null only if no therapy mentioned.",
           "indication": "What mutation this targets, synthesised from excerpts. [SOURCE_X]. null only if no indication content.",
           "outcome": "Key outcome data synthesised from excerpts. [SOURCE_X]. null only if no outcome data."
         }}
       ]
     }},
-    {{
-      "header": "Genetic Testing Guidance",
-      "content": "When to test, method used, clinical decisions it informs — synthesised from excerpts. [SOURCE_X]. null only if no testing guidance in any excerpt."
-    }}
+    {{"header": "Genetic Testing Guidance", "content": "When to test, method used, clinical decisions it informs — synthesised from excerpts. [SOURCE_X]. null only if no testing guidance."}}
   ]
 }}
 Return ONLY valid JSON:"""
@@ -1174,16 +1000,11 @@ Return ONLY valid JSON:"""
     ) -> Dict[str, Any]:
         """
         Full pipeline:
-          1.  Classify
-          2.  Expand queries
-          3.  Bi-encoder retrieval
-          4.  Deduplicate
-          5.  Cross-encoder reranking
-          6.  Build tagged context
-          7.  Compute evidence confidence
-          8.  Generate JSON answer
-          9.  Faithfulness evaluation
-          10. Credibility scorecard (all 7 metrics)
+          1.  Classify          6.  Build tagged context
+          2.  Expand queries    7.  Compute evidence confidence
+          3.  Bi-encoder retrieval   8.  Generate JSON answer
+          4.  Deduplicate       9.  Faithfulness evaluation
+          5.  Cross-encoder reranking  10. Credibility scorecard
         """
         # 1
         question_type = self._classify_question_type(question)
@@ -1205,10 +1026,10 @@ Return ONLY valid JSON:"""
         unique_retrieved = self._deduplicate_chunks(all_retrieved)
         if not unique_retrieved:
             return {
-                "error":      "No relevant information found",
+                "error":         "No relevant information found",
                 "json_response": None,
-                "sources":    {},
-                "confidence": {"label": "Low", "score": 0, "breakdown": "No data"},
+                "sources":       {},
+                "confidence":    {"label": "Low", "score": 0, "breakdown": "No data"},
             }
 
         # 5
@@ -1252,7 +1073,6 @@ Return ONLY valid JSON:"""
                     "error": str(e), "total_statements": 0, "evaluated_statements": 0,
                 }
 
-            # Partial result so credibility evaluator can read it
             partial_result = {
                 "json_response":   json_response,
                 "sources":         source_map,
@@ -1266,7 +1086,7 @@ Return ONLY valid JSON:"""
                 },
             }
 
-            # 10 — Credibility scorecard (all 7 metrics)
+            # 10 — Credibility scorecard
             logger.info("Computing credibility scorecard (all 7 metrics)...")
             try:
                 credibility_scorecard = self.credibility_evaluator.compute_scorecard(
@@ -1276,21 +1096,16 @@ Return ONLY valid JSON:"""
                     unanswerable_questions=self.credibility_evaluator.unanswerable_cache,
                 )
                 logger.info(
-                    f"Credibility score: {credibility_scorecard.get('total_score','N/A')}/100 "
+                    f"Credibility: {credibility_scorecard.get('total_score','N/A')}/100 "
                     f"({credibility_scorecard.get('overall_label','N/A')})"
                 )
             except Exception as e:
                 logger.error(f"Credibility scorecard failed: {e}", exc_info=True)
                 credibility_scorecard = {
-                    "error":         str(e),
-                    "total_score":   None,
-                    "overall_label": "Not Available",
+                    "error": str(e), "total_score": None, "overall_label": "Not Available",
                 }
 
-            return {
-                **partial_result,
-                "credibility_scorecard": credibility_scorecard,
-            }
+            return {**partial_result, "credibility_scorecard": credibility_scorecard}
 
         except json.JSONDecodeError as e:
             logger.error(f"JSON parse failed: {e}\nResponse was: {response}")
