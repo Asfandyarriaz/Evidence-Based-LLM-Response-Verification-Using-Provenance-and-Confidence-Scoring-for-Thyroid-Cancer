@@ -997,6 +997,7 @@ Return ONLY valid JSON:"""
         question: str,
         chat_history: Optional[list] = None,
         k: int = 30,
+        skip_credibility: bool = False,   # ← NEW: prevents recursive scorecard calls
     ) -> Dict[str, Any]:
         """
         Full pipeline:
@@ -1004,7 +1005,8 @@ Return ONLY valid JSON:"""
           2.  Expand queries    7.  Compute evidence confidence
           3.  Bi-encoder retrieval   8.  Generate JSON answer
           4.  Deduplicate       9.  Faithfulness evaluation
-          5.  Cross-encoder reranking  10. Credibility scorecard
+          5.  Cross-encoder reranking  10. Credibility scorecard (skipped when
+                                           called internally by credibility evaluator)
         """
         # 1
         question_type = self._classify_question_type(question)
@@ -1087,25 +1089,30 @@ Return ONLY valid JSON:"""
             }
 
             # 10 — Credibility scorecard
-            logger.info("Computing credibility scorecard (all 7 metrics)...")
-            try:
-                credibility_scorecard = self.credibility_evaluator.compute_scorecard(
-                    question=question,
-                    result=partial_result,
-                    run_consistency=True,
-                    unanswerable_questions=self.credibility_evaluator.unanswerable_cache,
-                )
-                logger.info(
-                    f"Credibility: {credibility_scorecard.get('total_score','N/A')}/100 "
-                    f"({credibility_scorecard.get('overall_label','N/A')})"
-                )
-            except Exception as e:
-                logger.error(f"Credibility scorecard failed: {e}", exc_info=True)
-                credibility_scorecard = {
-                    "error": str(e), "total_score": None, "overall_label": "Not Available",
-                }
-
-            return {**partial_result, "credibility_scorecard": credibility_scorecard}
+            # skip_credibility=True when called internally by M5/M6 to prevent
+            # infinite recursion: answer() → scorecard → answer() → scorecard → …
+            if not skip_credibility:
+                logger.info("Computing credibility scorecard (all 7 metrics)...")
+                try:
+                    credibility_scorecard = self.credibility_evaluator.compute_scorecard(
+                        question=question,
+                        result=partial_result,
+                        run_consistency=True,
+                        unanswerable_questions=self.credibility_evaluator.unanswerable_cache,
+                    )
+                    logger.info(
+                        f"Credibility: {credibility_scorecard.get('total_score','N/A')}/100 "
+                        f"({credibility_scorecard.get('overall_label','N/A')})"
+                    )
+                except Exception as e:
+                    logger.error(f"Credibility scorecard failed: {e}", exc_info=True)
+                    credibility_scorecard = {
+                        "error": str(e), "total_score": None, "overall_label": "Not Available",
+                    }
+                return {**partial_result, "credibility_scorecard": credibility_scorecard}
+            else:
+                # Internal call from credibility evaluator — return without scorecard
+                return partial_result
 
         except json.JSONDecodeError as e:
             logger.error(f"JSON parse failed: {e}\nResponse was: {response}")
