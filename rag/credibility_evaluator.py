@@ -284,6 +284,8 @@ Return ONLY a valid JSON array of {n} question strings. No preamble, no markdown
         For each unanswerable question, run the pipeline and check whether
         the system correctly refuses / returns mostly null sections.
 
+        Uses skip_credibility=True to prevent recursive scorecard computation.
+
         Correct refusal criteria (either):
         - null_rate >= 0.60  (majority of JSON fields are null)
         - faithfulness < 0.35 (very low grounding — likely hallucinated)
@@ -293,7 +295,9 @@ Return ONLY a valid JSON array of {n} question strings. No preamble, no markdown
 
         for question in unanswerable_questions:
             try:
-                result        = self.pipeline.answer(question)
+                # skip_credibility=True prevents answer() triggering another
+                # scorecard, which would call this method again (infinite loop)
+                result        = self.pipeline.answer(question, skip_credibility=True)
                 json_resp     = result.get("json_response") or {}
                 faithfulness  = result.get("faithfulness", {})
                 faith_score   = faithfulness.get("score")
@@ -378,6 +382,8 @@ Return ONLY a valid JSON array of {n} question strings. No preamble, no markdown
         Runs up to 3 paraphrases through the pipeline and measures:
 
         Agreement = 0.4 × source_jaccard + 0.6 × LLM_semantic_similarity
+
+        Uses skip_credibility=True to prevent recursive scorecard computation.
         """
         try:
             paraphrases = self.pipeline._expand_query_with_llm(question)
@@ -400,7 +406,9 @@ Return ONLY a valid JSON array of {n} question strings. No preamble, no markdown
 
             for alt_q in alts:
                 try:
-                    alt_result   = self.pipeline.answer(alt_q)
+                    # skip_credibility=True prevents answer() triggering another
+                    # scorecard, which would call this method again (infinite loop)
+                    alt_result   = self.pipeline.answer(alt_q, skip_credibility=True)
                     alt_sources  = set(alt_result.get("sources", {}).keys())
                     alt_overview = (alt_result.get("json_response") or {}).get("overview", "")
 
@@ -566,6 +574,9 @@ Respond with ONLY a single decimal number (e.g. 0.8). Nothing else:"""
             result:                 Output from pipeline.answer()
             run_consistency:        Whether to run M6 (adds ~3 pipeline calls)
             unanswerable_questions: Pre-generated list for M5; if None M5 is skipped
+
+        Note: M5 and M6 call pipeline.answer() internally with skip_credibility=True
+        to prevent recursive scorecard computation.
         """
         logger.info(f"Computing scorecard for: '{question[:70]}'")
 
@@ -697,7 +708,9 @@ Respond with ONLY a single decimal number (e.g. 0.8). Nothing else:"""
         for i, q in enumerate(questions, 1):
             logger.info(f"  [{i}/{len(questions)}] {q[:70]}")
             try:
-                result    = self.pipeline.answer(q)
+                # skip_credibility=True not needed here — batch eval calls
+                # compute_scorecard directly with the result, not via answer()
+                result    = self.pipeline.answer(q, skip_credibility=True)
                 scorecard = self.compute_scorecard(
                     question=q,
                     result=result,
