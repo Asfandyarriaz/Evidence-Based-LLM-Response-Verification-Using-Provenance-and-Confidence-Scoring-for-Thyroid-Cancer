@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from sentence_transformers import CrossEncoder
 
+# Import evaluators
 try:
     from .faithfulness_evaluator import FaithfulnessEvaluator
     from .credibility_evaluator import CredibilityEvaluator
@@ -19,6 +20,7 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Evidence level definitions for confidence scoring
 EVIDENCE_LEVEL_WEIGHTS: Dict[int, Tuple[str, float]] = {
     1: ("Guidelines / Consensus", 1.00),
     2: ("Systematic Review / Meta-analysis", 0.90),
@@ -29,11 +31,12 @@ EVIDENCE_LEVEL_WEIGHTS: Dict[int, Tuple[str, float]] = {
     7: ("Case Reports / Series", 0.40),
 }
 
-FIRST_STAGE_RETRIEVAL   = 100
-SECOND_STAGE_TOP_K      = 20
-MAX_SOURCES             = 10
-MAX_CHUNKS_PER_SOURCE   = 3
-MAX_EXCERPT_CHARS       = 1200
+# Retrieval configuration
+FIRST_STAGE_RETRIEVAL = 100
+SECOND_STAGE_TOP_K = 20
+MAX_SOURCES = 10
+MAX_CHUNKS_PER_SOURCE = 3
+MAX_EXCERPT_CHARS = 1200
 MAX_TOTAL_CONTEXT_CHARS = 10000
 
 
@@ -46,11 +49,11 @@ class QAPipeline:
         instruction_file: str = "instructions/rag_instructions.txt",
         cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
     ):
-        self.embedder     = embedder
+        self.embedder = embedder
         self.vector_store = vector_store
-        self.llm          = llm_client
+        self.llm = llm_client
 
-        env  = os.getenv("ENV", "local").lower()
+        env = os.getenv("ENV", "local").lower()
         base = Path(__file__).parent if env == "prod" else Path(".")
         self.instructions = (base / instruction_file).read_text(encoding="utf-8")
 
@@ -64,8 +67,6 @@ class QAPipeline:
 
         logger.info("Initializing credibility evaluator")
         self.credibility_evaluator = CredibilityEvaluator(pipeline=self, llm=self.llm)
-        # Populated once at app startup by app.py
-        self.credibility_evaluator.unanswerable_cache = None
         logger.info("Credibility evaluator initialized")
 
     # =========================================================================
@@ -73,13 +74,20 @@ class QAPipeline:
     # =========================================================================
 
     def _classify_question_type(self, question: str) -> str:
+        """
+        Classify question into one of 13 types using a three-layer defence:
+          Layer 1: _keyword_preclassify  (deterministic, no LLM)
+          Layer 2: LLM classifier
+          Layer 3: post-LLM safety net reclassifiers
+        """
+        # LAYER 1
         pre_check = self._keyword_preclassify(question)
         if pre_check:
             logger.info(f"Pre-classified by keyword: {pre_check}")
             return pre_check
 
+        # LAYER 2
         classification_prompt = f"""Classify this thyroid cancer question into ONE category.
-
 Categories:
 - definition:          "What is X?", "Tell me about X", "Explain X", "Describe X"
 - complications:       "What are complications/risks/side effects of X?"
@@ -102,9 +110,7 @@ Categories:
                        "How does X recur?"
 - molecular:           "What is the role of [gene] in X?", "What is BRAF/RET/TERT?",
                        "Molecular drivers of X?"
-
 Question: {question}
-
 Critical rules:
 - "evidence", "efficacy", "trial", "outcomes" keywords → evidence
 - Gene names (BRAF, RET, TERT, NTRK, RAS) → molecular
@@ -113,7 +119,6 @@ Critical rules:
 - "how does X affect management/prognosis" → impact
 - Follow-up or surveillance after treatment → surveillance
 - Recurrence patterns or detection → recurrence
-
 Return ONLY the category name (one word), nothing else:"""
 
         try:
@@ -128,6 +133,7 @@ Return ONLY the category name (one word), nothing else:"""
                 logger.warning(f"Invalid category '{category}', defaulting to definition")
                 category = "definition"
 
+            # LAYER 3
             if category == "definition":
                 category = self._reclassify_if_diagnostic_tool(question, category)
             if category == "definition":
@@ -294,7 +300,7 @@ Return ONLY the category name (one word), nothing else:"""
             "mutation", "gene", "oncogene", "proto-oncogene", "molecular",
             "pathway", "mapk", "driver", "germline", "somatic", "hereditary",
         ]
-        mentions_gene    = any(gene in q for gene in genes)
+        mentions_gene = any(gene in q for gene in genes)
         mentions_context = any(ctx in q for ctx in molecular_context)
         if mentions_gene and mentions_context:
             logger.info(f"Reclassifying '{question}' → molecular")
@@ -320,13 +326,13 @@ Return ONLY the category name (one word), nothing else:"""
         pairs = []
         for chunk in chunks:
             doc_text = chunk.get("text", "")
-            title    = chunk.get("title", "")
+            title = chunk.get("title", "")
             combined = f"{title}. {doc_text}" if title and title not in doc_text else doc_text
             pairs.append([question, combined[:2000]])
         scores = self.cross_encoder.predict(pairs)
         for idx, chunk in enumerate(chunks):
             chunk["score"] = float(scores[idx])
-        reranked   = sorted(chunks, key=lambda x: x.get("score", 0), reverse=True)
+        reranked = sorted(chunks, key=lambda x: x.get("score", 0), reverse=True)
         top_chunks = reranked[:top_k]
         logger.info(f"Re-ranking complete: top={top_chunks[0]['score']:.4f}")
         for i, chunk in enumerate(top_chunks[:3], 1):
@@ -336,23 +342,17 @@ Return ONLY the category name (one word), nothing else:"""
     def diagnose_retrieval(self, question: str, k: int = 10) -> Dict[str, Any]:
         logger.info("=== DIAGNOSTIC MODE ===")
         sub_queries = self._expand_query_with_llm(question)
-        diagnosis   = {
-            "original_question":     question,
-            "sub_queries_generated": sub_queries,
-            "retrieval_results":     [],
-        }
+        diagnosis = {"original_question": question, "sub_queries_generated": sub_queries, "retrieval_results": []}
         for idx, sub_query in enumerate(sub_queries, 1):
             chunks = self.vector_store.search(sub_query, k=k)
             result = {"query": sub_query, "chunks_found": len(chunks), "sample_chunks": []}
             for i, chunk in enumerate(chunks[:3], 1):
                 result["sample_chunks"].append({
-                    "rank":           i,
-                    "title":          chunk.get("title", "No title"),
-                    "year":           chunk.get("year", "Unknown"),
-                    "pmid":           chunk.get("pmid", "Unknown"),
+                    "rank": i, "title": chunk.get("title", "No title"),
+                    "year": chunk.get("year", "Unknown"), "pmid": chunk.get("pmid", "Unknown"),
                     "evidence_level": chunk.get("evidence_level", "Unknown"),
-                    "score":          chunk.get("score", 0.0),
-                    "text_preview":   chunk.get("text", "")[:400] + "...",
+                    "score": chunk.get("score", 0.0),
+                    "text_preview": chunk.get("text", "")[:400] + "..."
                 })
             diagnosis["retrieval_results"].append(result)
         logger.info("=== END DIAGNOSTIC ===")
@@ -361,18 +361,15 @@ Return ONLY the category name (one word), nothing else:"""
     def _expand_query_with_llm(self, question: str) -> List[str]:
         expansion_prompt = f"""You are a medical information retrieval assistant specialised in thyroid cancer.
 Given a user question, generate 3-5 targeted search queries to retrieve comprehensive information.
-
 Guidelines:
 1. Include the original question
 2. Focus on: main topic, complications/risks, clinical outcomes, patient selection, alternatives
 3. Use specific medical terminology from research papers
-
 Question: {question}
-
 Return ONLY a JSON array of 3-5 search queries, no other text:"""
         try:
             response = self.llm.ask(expansion_prompt)
-            cleaned  = response.strip()
+            cleaned = response.strip()
             if cleaned.startswith("```"):
                 cleaned = re.sub(r'^```(?:json)?\s*\n?', '', cleaned)
                 cleaned = re.sub(r'\n?```\s*$', '', cleaned)
@@ -389,8 +386,9 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
             return self._create_fallback_queries(question)
 
     def _add_fallback_queries(self, original_question: str, existing_queries: List[str]) -> List[str]:
-        q          = original_question.lower()
+        q = original_question.lower()
         additional = []
+
         if any(w in q for w in ["evidence", "trial", "efficacy", "outcome", "study", "data", "effective"]):
             topic = self._extract_topic(original_question) or "thyroid cancer treatment"
             additional.extend([
@@ -424,12 +422,14 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
                 "RET mutation medullary thyroid cancer targeted therapy",
                 "molecular targeted therapy thyroid cancer",
             ])
+
         if any(term in q for term in ["radioactive iodine", "rai", "i-131", "radioiodine"]):
             additional.extend([
                 "salivary gland dysfunction radioactive iodine",
                 "xerostomia RAI therapy",
                 "secondary malignancy radioiodine",
             ])
+
         for query in additional:
             if query not in existing_queries:
                 existing_queries.append(query)
@@ -437,10 +437,7 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
 
     def _extract_topic(self, question: str) -> Optional[str]:
         q = question.lower()
-        for pattern in [
-            r'(?:of|for)\s+(.+?)(?:\?|$)',
-            r'(?:what|how)\s+(?:is|are)\s+(.+?)(?:\?|treated|diagnosed)',
-        ]:
+        for pattern in [r'(?:of|for)\s+(.+?)(?:\?|$)', r'(?:what|how)\s+(?:is|are)\s+(.+?)(?:\?|treated|diagnosed)']:
             match = re.search(pattern, q)
             if match:
                 topic = match.group(1).strip()
@@ -449,7 +446,7 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
         return None
 
     def _create_fallback_queries(self, question: str) -> List[str]:
-        q       = question.lower()
+        q = question.lower()
         queries = [question]
         if any(w in q for w in ["complication", "risk", "adverse", "side effect"]):
             topic = self._extract_topic(question) or "thyroid cancer treatment"
@@ -459,7 +456,7 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
         return queries
 
     def _deduplicate_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        seen   = set()
+        seen = set()
         unique = []
         for chunk in chunks:
             chunk_id = f"{chunk.get('pmid','unknown')}||{hash(chunk.get('text','')[:200].strip())}"
@@ -475,25 +472,25 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
             key = str(r.get("pmid") or r.get("title"))
             grouped.setdefault(key, []).append(r)
 
-        source_map   = {}
+        source_map = {}
         tagged_parts = []
-        total_chars  = 0
-        source_id    = 1
+        total_chars = 0
+        source_id = 1
 
         for group in grouped.values():
             if source_id > MAX_SOURCES:
                 break
-            meta       = group[0]
+            meta = group[0]
             source_tag = f"SOURCE_{source_id}"
             source_map[source_tag] = {
-                "title":               meta.get("title", "Unknown"),
-                "year":                meta.get("year", "Unknown"),
-                "pmid":                meta.get("pmid", "Unknown"),
-                "evidence_level":      meta.get("evidence_level", "Unknown"),
+                "title": meta.get("title", "Unknown"),
+                "year": meta.get("year", "Unknown"),
+                "pmid": meta.get("pmid", "Unknown"),
+                "evidence_level": meta.get("evidence_level", "Unknown"),
                 "cross_encoder_score": meta.get("score", 0.0),
             }
             for chunk in group[:MAX_CHUNKS_PER_SOURCE]:
-                text        = chunk.get("text", "")[:MAX_EXCERPT_CHARS]
+                text = chunk.get("text", "")[:MAX_EXCERPT_CHARS]
                 tagged_text = f"[{source_tag}] {text}"
                 if total_chars + len(tagged_text) > MAX_TOTAL_CONTEXT_CHARS:
                     break
@@ -509,9 +506,9 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
         levels = [r.get("evidence_level") for r in retrieved if r.get("evidence_level") in EVIDENCE_LEVEL_WEIGHTS]
         if not levels:
             return {"label": "Low", "score": 0, "breakdown": "No evidence metadata"}
-        weights   = [EVIDENCE_LEVEL_WEIGHTS[l][1] for l in levels]
-        score     = int(round((sum(weights) / len(weights)) * 100))
-        label     = "High" if score >= 85 else "Medium" if score >= 65 else "Low"
+        weights = [EVIDENCE_LEVEL_WEIGHTS[l][1] for l in levels]
+        score = int(round((sum(weights) / len(weights)) * 100))
+        label = "High" if score >= 85 else "Medium" if score >= 65 else "Low"
         breakdown = "; ".join(
             f"Level {l} ({EVIDENCE_LEVEL_WEIGHTS[l][0]}): {levels.count(l)}"
             for l in sorted(set(levels))
@@ -523,24 +520,16 @@ Return ONLY a JSON array of 3-5 search queries, no other text:"""
     # =========================================================================
 
     def _create_type_specific_prompt(self, question: str, context: str, question_type: str) -> str:
-        """
-        Synthesis mode: LLM synthesises from excerpts, never collapses to null
-        unless the topic is genuinely absent from all excerpts. Every claim
-        carries a [SOURCE_X] tag for traceability.
-        """
         base = f"""
 {self.instructions}
-
 You are a medical information assistant specialised in thyroid cancer.
 Answer by SYNTHESISING the tagged excerpts below. Every factual claim must cite
 the excerpt(s) it came from using [SOURCE_X] tags.
-
 SOURCE TAGGING RULES:
 - Every factual sentence must end with one or more source tags: "Fact. [SOURCE_1]"
 - Combine tags for multi-source synthesis: "Fact. [SOURCE_1][SOURCE_3]"
 - Never write a factual sentence without at least one [SOURCE_X] tag.
 - When you paraphrase or synthesise across excerpts, cite all contributing sources.
-
 SYNTHESIS CONTRACT:
 1. SYNTHESISE from the excerpts — combine, paraphrase, and infer where the excerpts
    collectively support a claim. You do not need verbatim text; reasonable medical
@@ -554,18 +543,14 @@ SYNTHESIS CONTRACT:
 6. Return ONLY valid JSON. No markdown fences, no preamble, no trailing text.
 7. Missing sections that cannot be addressed from ANY excerpt: set content/items to
    null silently. Do NOT explain what is missing.
-
 CONTEXT WITH SOURCE TAGS:
 {context}
-
 """
 
         if question_type == "evidence":
             return base + f"""
 QUESTION: {question}
-
 Synthesise evidence across all sources. Organise by cancer subtype, not by source.
-
 {{
   "overview": "2-3 sentences on TKI role, approval status, overall evidence quality synthesised from excerpts. [SOURCE_X]. REQUIRED — never null.",
   "sections": [
@@ -615,12 +600,9 @@ Return ONLY valid JSON:"""
         elif question_type == "definition":
             return base + f"""
 QUESTION: {question}
-
-Synthesise a clear, patient-facing definition from the excerpts. Even if individual
-excerpts are narrow or specialist, combine them to construct a coherent overview.
-
+Synthesise a clear, patient-facing definition from the excerpts.
 {{
-  "overview": "2-3 sentence definition synthesised from excerpts: what thyroid cancer is, who it affects, general outlook. [SOURCE_X]. REQUIRED — never null.",
+  "overview": "2-3 sentence definition synthesised from excerpts. [SOURCE_X]. REQUIRED — never null.",
   "sections": [
     {{
       "header": "Key Types",
@@ -636,7 +618,7 @@ excerpts are narrow or specialist, combine them to construct a coherent overview
       "header": "Key Characteristics",
       "items": [
         {{
-          "aspect": "Real aspect synthesised from excerpts (e.g. Growth pattern, Prevalence, Histology). null only if excerpts contain no characteristic information.",
+          "aspect": "Real aspect synthesised from excerpts. null only if excerpts contain no characteristic information.",
           "description": "Explanation synthesised from excerpts. [SOURCE_X]. null only if no relevant excerpt content."
         }}
       ]
@@ -659,7 +641,6 @@ Return ONLY valid JSON:"""
         elif question_type == "complications":
             return base + f"""
 QUESTION: {question}
-
 {{
   "overview": "2-3 sentence summary of the complication landscape synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
@@ -699,7 +680,6 @@ Return ONLY valid JSON:"""
         elif question_type == "comparison":
             return base + f"""
 QUESTION: {question}
-
 {{
   "overview": "2-3 sentence comparison summary with clinical context synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
@@ -732,7 +712,6 @@ Return ONLY valid JSON:"""
         elif question_type == "treatment":
             return base + f"""
 QUESTION: {question}
-
 {{
   "overview": "2-3 sentence treatment landscape synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
@@ -762,7 +741,6 @@ Return ONLY valid JSON:"""
         elif question_type == "diagnosis":
             return base + f"""
 QUESTION: {question}
-
 {{
   "overview": "2-3 sentence summary of the diagnostic approach and its clinical value, synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
@@ -783,7 +761,6 @@ Return ONLY valid JSON:"""
         elif question_type == "timing":
             return base + f"""
 QUESTION: {question}
-
 {{
   "overview": "2-3 sentence summary of when and why this is recommended, synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
@@ -813,7 +790,6 @@ Return ONLY valid JSON:"""
         elif question_type == "staging":
             return base + f"""
 QUESTION: {question}
-
 {{
   "overview": "2-3 sentences: staging system, cancer type it applies to, key distinguishing features synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
@@ -845,7 +821,6 @@ Return ONLY valid JSON:"""
         elif question_type == "risk_stratification":
             return base + f"""
 QUESTION: {question}
-
 {{
   "overview": "2-3 sentences: stratification system (e.g. ATA 2015), what it predicts, how it guides treatment — synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
@@ -872,7 +847,6 @@ Return ONLY valid JSON:"""
         elif question_type == "impact":
             return base + f"""
 QUESTION: {question}
-
 {{
   "overview": "2-3 sentences: how common is this factor, its primary clinical impact, overall significance — synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
@@ -896,7 +870,6 @@ Return ONLY valid JSON:"""
         elif question_type == "surveillance":
             return base + f"""
 QUESTION: {question}
-
 {{
   "overview": "2-3 sentences: what surveillance consists of, primary tests, risk-stratified approach — synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
@@ -922,7 +895,6 @@ Return ONLY valid JSON:"""
         elif question_type == "recurrence":
             return base + f"""
 QUESTION: {question}
-
 {{
   "overview": "2-3 sentences: overall recurrence rate, most common site, primary detection method — synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
@@ -952,7 +924,6 @@ Return ONLY valid JSON:"""
         elif question_type == "molecular":
             return base + f"""
 QUESTION: {question}
-
 {{
   "overview": "2-3 sentences: what this gene/mutation is, how common it is, overall clinical importance — synthesised from excerpts. [SOURCE_X]. REQUIRED.",
   "sections": [
@@ -996,27 +967,29 @@ Return ONLY valid JSON:"""
         self,
         question: str,
         chat_history: Optional[list] = None,
-        k: int = 30,
-        skip_credibility: bool = False,   # ← NEW: prevents recursive scorecard calls
+        k: int = 30
     ) -> Dict[str, Any]:
         """
         Full pipeline:
-          1.  Classify          6.  Build tagged context
-          2.  Expand queries    7.  Compute evidence confidence
-          3.  Bi-encoder retrieval   8.  Generate JSON answer
-          4.  Deduplicate       9.  Faithfulness evaluation
-          5.  Cross-encoder reranking  10. Credibility scorecard (skipped when
-                                           called internally by credibility evaluator)
+          1. Classify → 2. Expand → 3. Retrieve → 4. Deduplicate →
+          5. Rerank → 6. Build context → 7. Confidence → 8. Answer →
+          9. Faithfulness → 10. Credibility scorecard (M1-M4, M7 only inline)
+
+        IMPORTANT — no recursion risk:
+          M5 (safe refusal) and M6 (consistency) both call pipeline.answer()
+          internally. They are NEVER run inline from here. They only run in
+          batch mode via credibility_evaluator.run_batch_evaluation().
+          Inline scorecard uses run_consistency=False, unanswerable_questions=None.
         """
-        # 1
+        # 1. Classify
         question_type = self._classify_question_type(question)
 
-        # 2
+        # 2. Expand
         sub_queries = self._expand_query_with_llm(question)
 
-        # 3
+        # 3. Retrieve
         logger.info("=== FIRST STAGE: Bi-encoder retrieval ===")
-        all_retrieved    = []
+        all_retrieved = []
         chunks_per_query = FIRST_STAGE_RETRIEVAL // len(sub_queries)
         for idx, sub_query in enumerate(sub_queries, 1):
             logger.info(f"Sub-query {idx}/{len(sub_queries)}: {sub_query}")
@@ -1024,29 +997,29 @@ Return ONLY valid JSON:"""
             all_retrieved.extend(retrieved)
         logger.info(f"First stage: {len(all_retrieved)} chunks")
 
-        # 4
+        # 4. Deduplicate
         unique_retrieved = self._deduplicate_chunks(all_retrieved)
         if not unique_retrieved:
             return {
-                "error":         "No relevant information found",
+                "error": "No relevant information found",
                 "json_response": None,
-                "sources":       {},
-                "confidence":    {"label": "Low", "score": 0, "breakdown": "No data"},
+                "sources": {},
+                "confidence": {"label": "Low", "score": 0, "breakdown": "No data"}
             }
 
-        # 5
+        # 5. Rerank
         logger.info("=== SECOND STAGE: Cross-encoder re-ranking ===")
         reranked_chunks = self._rerank_with_cross_encoder(
             question=question, chunks=unique_retrieved, top_k=SECOND_STAGE_TOP_K
         )
 
-        # 6
+        # 6. Context
         context, source_map = self._build_tagged_context(reranked_chunks)
 
-        # 7
+        # 7. Confidence
         confidence = self._compute_confidence(reranked_chunks)
 
-        # 8
+        # 8. Generate answer
         logger.info(f"Generating '{question_type}' answer...")
         prompt = self._create_type_specific_prompt(question, context, question_type)
         try:
@@ -1056,69 +1029,66 @@ Return ONLY valid JSON:"""
                 response = re.sub(r'\n?```\s*$', '', response)
             json_response = json.loads(response)
 
-            # 9 — Faithfulness
+            # 9. Faithfulness
             logger.info("Evaluating faithfulness...")
             try:
                 faithfulness = self.faithfulness_evaluator.evaluate(
                     json_response=json_response,
                     tagged_context=context,
-                    source_map=source_map,
+                    source_map=source_map
                 )
-                logger.info(
-                    f"Faithfulness: {faithfulness.get('label','N/A')} "
-                    f"({faithfulness.get('score','N/A')})"
-                )
+                logger.info(f"Faithfulness: {faithfulness.get('label','N/A')} ({faithfulness.get('score','N/A')})")
             except Exception as e:
                 logger.error(f"Faithfulness evaluation failed: {e}", exc_info=True)
                 faithfulness = {
                     "score": None, "label": "Not Available",
-                    "error": str(e), "total_statements": 0, "evaluated_statements": 0,
+                    "error": str(e), "total_statements": 0, "evaluated_statements": 0
                 }
 
-            partial_result = {
-                "json_response":   json_response,
-                "sources":         source_map,
-                "confidence":      confidence,
-                "faithfulness":    faithfulness,
-                "question_type":   question_type,
+            result = {
+                "json_response": json_response,
+                "sources": source_map,
+                "confidence": confidence,
+                "faithfulness": faithfulness,
+                "question_type": question_type,
                 "retrieval_stats": {
                     "first_stage_retrieved": len(all_retrieved),
-                    "after_dedup":           len(unique_retrieved),
-                    "after_reranking":       len(reranked_chunks),
-                },
+                    "after_dedup": len(unique_retrieved),
+                    "after_reranking": len(reranked_chunks),
+                }
             }
 
-            # 10 — Credibility scorecard
-            # skip_credibility=True when called internally by M5/M6 to prevent
-            # infinite recursion: answer() → scorecard → answer() → scorecard → …
-            if not skip_credibility:
-                logger.info("Computing credibility scorecard (all 7 metrics)...")
-                try:
-                    credibility_scorecard = self.credibility_evaluator.compute_scorecard(
-                        question=question,
-                        result=partial_result,
-                        run_consistency=True,
-                        unanswerable_questions=self.credibility_evaluator.unanswerable_cache,
-                    )
-                    logger.info(
-                        f"Credibility: {credibility_scorecard.get('total_score','N/A')}/100 "
-                        f"({credibility_scorecard.get('overall_label','N/A')})"
-                    )
-                except Exception as e:
-                    logger.error(f"Credibility scorecard failed: {e}", exc_info=True)
-                    credibility_scorecard = {
-                        "error": str(e), "total_score": None, "overall_label": "Not Available",
-                    }
-                return {**partial_result, "credibility_scorecard": credibility_scorecard}
-            else:
-                # Internal call from credibility evaluator — return without scorecard
-                return partial_result
+            # 10. Credibility scorecard — SAFE INLINE MODE
+            # run_consistency=False → M6 skipped (would call pipeline.answer())
+            # unanswerable_questions=None → M5 skipped (would call pipeline.answer())
+            # M1, M2, M3, M4, M7 all compute from the existing result dict only.
+            # Zero additional pipeline.answer() calls. Zero recursion risk.
+            logger.info("Computing credibility scorecard (M1-M4, M7)...")
+            try:
+                credibility_scorecard = self.credibility_evaluator.compute_scorecard(
+                    question=question,
+                    result=result,
+                    run_consistency=False,
+                    unanswerable_questions=None,
+                )
+                logger.info(
+                    f"Credibility: {credibility_scorecard.get('total_score','N/A')}/100 "
+                    f"({credibility_scorecard.get('overall_label','N/A')})"
+                )
+                result["credibility_scorecard"] = credibility_scorecard
+            except Exception as e:
+                logger.error(f"Credibility scorecard failed: {e}", exc_info=True)
+                result["credibility_scorecard"] = {
+                    "error": str(e), "total_score": None, "overall_label": "Not Available"
+                }
+
+            return result
 
         except json.JSONDecodeError as e:
             logger.error(f"JSON parse failed: {e}\nResponse was: {response}")
             return {
-                "error":         f"Failed to generate structured response: {str(e)}",
+                "error": f"Failed to generate structured response: {str(e)}",
                 "json_response": None,
-                "sources":       source_map,
-                "confidence":    confidence,
+                "sources": source_map,
+                "confidence": confidence
             }
