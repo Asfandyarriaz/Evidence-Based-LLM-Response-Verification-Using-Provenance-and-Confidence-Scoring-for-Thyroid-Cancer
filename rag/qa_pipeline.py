@@ -1016,10 +1016,7 @@ Return ONLY valid JSON:"""
         # 6. Context
         context, source_map = self._build_tagged_context(reranked_chunks)
 
-        # 7. Confidence
-        confidence = self._compute_confidence(reranked_chunks)
-
-        # 8. Generate answer
+        # 7. Generate answer
         logger.info(f"Generating '{question_type}' answer...")
         prompt = self._create_type_specific_prompt(question, context, question_type)
         try:
@@ -1028,6 +1025,18 @@ Return ONLY valid JSON:"""
                 response = re.sub(r'^```(?:json)?\s*\n?', '', response)
                 response = re.sub(r'\n?```\s*$', '', response)
             json_response = json.loads(response)
+
+            # 8. Confidence — computed from cited sources only
+            cited_keys = set(re.findall(r'SOURCE_\d+', json.dumps(json_response)))
+            cited_meta = [
+                {"evidence_level": source_map[k]["evidence_level"]}
+                for k in cited_keys
+                if k in source_map
+            ]
+            confidence = (
+                self._compute_confidence(cited_meta) if cited_meta
+                else self._compute_confidence(reranked_chunks)  # fallback if no citations
+            )
 
             # 9. Faithfulness
             logger.info("Evaluating faithfulness...")
