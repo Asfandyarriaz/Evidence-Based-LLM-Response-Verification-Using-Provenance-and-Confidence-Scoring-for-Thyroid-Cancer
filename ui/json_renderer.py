@@ -202,7 +202,7 @@ class JSONRenderer:
         rows_data = [
             ("M1", "Factual Correctness",  pill(m1.get("score_0_100")),
              m1.get("label",""), "Evidence-level trust proxy"),
-            ("M2", "Grounding",            pill(m2.get("score_0_100")),
+            ("M2", "Faithfulness",          pill(m2.get("score_0_100")),
              m2.get("label",""), "Supported-claim rate"),
             ("M3", "Hallucination Rate",   hall_pill(m3.get("rate_pct")),
              m3.get("label",""), "% unsupported claims — lower is better"),
@@ -289,11 +289,10 @@ class JSONRenderer:
     def _render_overview(self) -> str:
         overview                = self.json_response.get("overview", "")
         overview_with_citations = self._replace_source_tags(overview)
-        faithfulness_badge      = self._render_faithfulness_badge()
 
         return f"""**AI Overview**
 {overview_with_citations}
-{faithfulness_badge}
+
 ---
 """
 
@@ -504,22 +503,19 @@ class JSONRenderer:
         score     = self.confidence.get("score", 0)
         breakdown = self.confidence.get("breakdown", "")
 
-        faithfulness_html = self._render_faithfulness_for_sources()
-        scorecard_html    = self._render_credibility_scorecard()
+        scorecard_html = self._render_credibility_scorecard()
 
         return f"""
-<details id="sources-section" class="sources-collapsible">
-<summary class="sources-summary">📚 Show Sources</summary>
-
-<div class="sources-content">
-
 <div class="evidence-quality">
 <strong>Evidence Quality:</strong> {label} confidence ({score}/100)
 <br>
 <em>Based on: {breakdown}</em>
 </div>
 
-{faithfulness_html}
+<details id="sources-section" class="sources-collapsible">
+<summary class="sources-summary">📚 Show Sources</summary>
+
+<div class="sources-content">
 
 {scorecard_html}
 
