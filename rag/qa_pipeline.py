@@ -991,10 +991,22 @@ Return ONLY valid JSON:"""
         logger.info("=== FIRST STAGE: Bi-encoder retrieval ===")
         all_retrieved = []
         chunks_per_query = FIRST_STAGE_RETRIEVAL // len(sub_queries)
+        MIN_COVERAGE_SCORE = 0.75
         for idx, sub_query in enumerate(sub_queries, 1):
             logger.info(f"Sub-query {idx}/{len(sub_queries)}: {sub_query}")
             retrieved = self.vector_store.search(sub_query, k=chunks_per_query)
+            max_score = max((c.get("score", 0) for c in retrieved), default=0)
+            if max_score < MIN_COVERAGE_SCORE:
+                logger.warning(
+                    f"Sub-query {idx} below coverage threshold "
+                    f"(max score {max_score:.3f} < {MIN_COVERAGE_SCORE}) — skipped"
+                )
+                continue
             all_retrieved.extend(retrieved)
+        if not all_retrieved:
+            logger.warning("All sub-queries below threshold — falling back to full retrieval")
+            for sub_query in sub_queries:
+                all_retrieved.extend(self.vector_store.search(sub_query, k=chunks_per_query))
         logger.info(f"First stage: {len(all_retrieved)} chunks")
 
         # 4. Deduplicate
@@ -1069,16 +1081,18 @@ Return ONLY valid JSON:"""
 
             # 10. Credibility scorecard — SAFE INLINE MODE
             # run_consistency=False → M6 skipped (would call pipeline.answer())
-            # unanswerable_questions=None → M5 skipped (would call pipeline.answer())
+            # unanswerable_cache passed → M5 runs using pre-generated questions (no extra LLM calls)
             # M1, M2, M3, M4, M7 all compute from the existing result dict only.
             # Zero additional pipeline.answer() calls. Zero recursion risk.
-            logger.info("Computing credibility scorecard (M1-M4, M7)...")
+            logger.info("Computing credibility scorecard (M1-M5, M7)...")
             try:
                 credibility_scorecard = self.credibility_evaluator.compute_scorecard(
                     question=question,
                     result=result,
                     run_consistency=False,
-                    unanswerable_questions=None,
+                    unanswerable_questions=getattr(
+                        self.credibility_evaluator, "unanswerable_cache", None
+                    ),
                 )
                 logger.info(
                     f"Credibility: {credibility_scorecard.get('total_score','N/A')}/100 "

@@ -118,7 +118,7 @@ class FaithfulnessEvaluator:
                 "label": label,
                 "total_statements": len(statements),
                 "evaluated_statements": evaluated_count,
-                "details": statement_details[:5]  # Only include first 5 for brevity
+                "details": statement_details
             }
             
         except Exception as e:
