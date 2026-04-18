@@ -28,10 +28,15 @@ class JSONRenderer:
     # HELPERS
     # =========================================================================
 
-    def _replace_source_tags(self, text: str) -> str:
+    def _replace_source_tags(self, text) -> str:
         """Replace [SOURCE_X] tags with clickable anchor-linked citations."""
         if not text:
             return ""
+        # Defensive: LLM occasionally returns a list instead of a plain string
+        if isinstance(text, list):
+            text = " ".join(str(item) for item in text if item)
+        elif not isinstance(text, str):
+            text = str(text)
         pattern = r'\[SOURCE_(\d+)\]'
 
         def replacement(match):
