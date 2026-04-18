@@ -134,28 +134,37 @@ class FaithfulnessEvaluator:
         """
         statements = []
         
+        def _coerce_str(val) -> str:
+            """Safely coerce a value to string (handles list returns from LLM)."""
+            if not val:
+                return ""
+            if isinstance(val, list):
+                return " ".join(str(v) for v in val if v)
+            return str(val)
+
         # Extract from overview
-        overview = json_response.get("overview", "")
+        overview = _coerce_str(json_response.get("overview", ""))
         if overview:
             statements.append((overview, self._extract_citations(overview)))
-        
+
         # Extract from sections
         sections = json_response.get("sections", [])
         for section in sections:
             # Section content (paragraph format)
             if "content" in section:
-                content = section["content"]
+                content = _coerce_str(section["content"])
                 if content:
                     statements.append((content, self._extract_citations(content)))
-            
+
             # Section items (bullet points)
             if "items" in section:
                 for item in section["items"]:
                     if isinstance(item, dict):
                         # Extract all text fields from item
                         for key, value in item.items():
-                            if isinstance(value, str) and value and key != "frequency":
-                                statements.append((value, self._extract_citations(value)))
+                            coerced = _coerce_str(value)
+                            if coerced and key != "frequency":
+                                statements.append((coerced, self._extract_citations(coerced)))
         
         return statements
     
