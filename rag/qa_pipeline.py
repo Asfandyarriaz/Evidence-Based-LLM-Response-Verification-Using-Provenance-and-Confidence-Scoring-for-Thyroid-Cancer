@@ -530,6 +530,12 @@ SOURCE TAGGING RULES:
 - Combine tags for multi-source synthesis: "Fact. [SOURCE_1][SOURCE_3]"
 - Never write a factual sentence without at least one [SOURCE_X] tag.
 - When you paraphrase or synthesise across excerpts, cite all contributing sources.
+SCOPE GUARD — READ FIRST:
+This system answers ONLY questions about thyroid cancer, thyroid tumors, or their
+clinical management. If the question is unrelated to thyroid cancer (e.g. cardiology,
+sports, finance, general AI, other cancers), you MUST return a JSON response where
+overview and ALL section content/items are set to null. Do NOT use parametric
+knowledge or training data to answer out-of-scope questions under any circumstances.
 SYNTHESIS CONTRACT:
 1. SYNTHESISE from the excerpts — combine, paraphrase, and infer where the excerpts
    collectively support a claim. You do not need verbatim text; reasonable medical
@@ -1080,16 +1086,15 @@ Return ONLY valid JSON:"""
             }
 
             # 10. Credibility scorecard — SAFE INLINE MODE
-            # run_consistency=False → M6 skipped (would call pipeline.answer())
+            # run_consistency=True → M6 runs with 1 paraphrase (limited for speed)
             # unanswerable_cache passed → M5 runs using pre-generated questions (no extra LLM calls)
             # M1, M2, M3, M4, M7 all compute from the existing result dict only.
-            # Zero additional pipeline.answer() calls. Zero recursion risk.
-            logger.info("Computing credibility scorecard (M1-M5, M7)...")
+            logger.info("Computing credibility scorecard (M1-M7)...")
             try:
                 credibility_scorecard = self.credibility_evaluator.compute_scorecard(
                     question=question,
                     result=result,
-                    run_consistency=False,
+                    run_consistency=True,
                     unanswerable_questions=getattr(
                         self.credibility_evaluator, "unanswerable_cache", None
                     ),
