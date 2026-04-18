@@ -302,10 +302,14 @@ Return ONLY a valid JSON array of {n} question strings. No preamble, no markdown
                 faithfulness  = result.get("faithfulness", {})
                 faith_score   = faithfulness.get("score")
 
+                # Primary signal: explicit refusal flag set by LLM or retrieval gate
+                explicit_refusal = bool(json_resp.get("refusal", False))
+
                 null_count, total_count = self._count_null_fields(json_resp)
                 null_rate = null_count / total_count if total_count > 0 else 1.0
 
                 is_correct = (
+                    explicit_refusal or
                     null_rate >= 0.60 or
                     (faith_score is not None and faith_score < 0.35)
                 )
@@ -314,6 +318,7 @@ Return ONLY a valid JSON array of {n} question strings. No preamble, no markdown
 
                 results.append({
                     "question":          question,
+                    "explicit_refusal":  explicit_refusal,
                     "null_rate":         round(null_rate, 2),
                     "null_sections":     null_count,
                     "total_fields":      total_count,
