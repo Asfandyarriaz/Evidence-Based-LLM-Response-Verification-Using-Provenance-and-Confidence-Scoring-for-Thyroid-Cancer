@@ -973,7 +973,8 @@ Return ONLY valid JSON:"""
         self,
         question: str,
         chat_history: Optional[list] = None,
-        k: int = 30
+        k: int = 30,
+        skip_credibility: bool = False,
     ) -> Dict[str, Any]:
         """
         Full pipeline:
@@ -1085,30 +1086,28 @@ Return ONLY valid JSON:"""
                 }
             }
 
-            # 10. Credibility scorecard — SAFE INLINE MODE
-            # run_consistency=True → M6 runs with 1 paraphrase (limited for speed)
-            # unanswerable_cache passed → M5 runs using pre-generated questions (no extra LLM calls)
-            # M1, M2, M3, M4, M7 all compute from the existing result dict only.
-            logger.info("Computing credibility scorecard (M1-M7)...")
-            try:
-                credibility_scorecard = self.credibility_evaluator.compute_scorecard(
-                    question=question,
-                    result=result,
-                    run_consistency=True,
-                    unanswerable_questions=getattr(
-                        self.credibility_evaluator, "unanswerable_cache", None
-                    ),
-                )
-                logger.info(
-                    f"Credibility: {credibility_scorecard.get('total_score','N/A')}/100 "
-                    f"({credibility_scorecard.get('overall_label','N/A')})"
-                )
-                result["credibility_scorecard"] = credibility_scorecard
-            except Exception as e:
-                logger.error(f"Credibility scorecard failed: {e}", exc_info=True)
-                result["credibility_scorecard"] = {
-                    "error": str(e), "total_score": None, "overall_label": "Not Available"
-                }
+            # 10. Credibility scorecard — skipped when called from M5/M6 internals
+            if not skip_credibility:
+                logger.info("Computing credibility scorecard (M1-M7)...")
+                try:
+                    credibility_scorecard = self.credibility_evaluator.compute_scorecard(
+                        question=question,
+                        result=result,
+                        run_consistency=True,
+                        unanswerable_questions=getattr(
+                            self.credibility_evaluator, "unanswerable_cache", None
+                        ),
+                    )
+                    logger.info(
+                        f"Credibility: {credibility_scorecard.get('total_score','N/A')}/100 "
+                        f"({credibility_scorecard.get('overall_label','N/A')})"
+                    )
+                    result["credibility_scorecard"] = credibility_scorecard
+                except Exception as e:
+                    logger.error(f"Credibility scorecard failed: {e}", exc_info=True)
+                    result["credibility_scorecard"] = {
+                        "error": str(e), "total_score": None, "overall_label": "Not Available"
+                    }
 
             return result
 
