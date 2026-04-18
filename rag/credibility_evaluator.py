@@ -390,7 +390,7 @@ Return ONLY a valid JSON array of {n} question strings. No preamble, no markdown
             alts = [
                 q for q in paraphrases
                 if q.lower().strip() != question.lower().strip()
-            ][:3]
+            ][:1]  # limit to 1 paraphrase inline to keep response time acceptable
 
             if not alts:
                 return {
