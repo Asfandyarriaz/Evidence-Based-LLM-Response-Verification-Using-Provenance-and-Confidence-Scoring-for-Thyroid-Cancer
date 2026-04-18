@@ -35,6 +35,10 @@ class JSONRenderer:
         # Defensive: LLM occasionally returns a list instead of a plain string
         if isinstance(text, list):
             text = " ".join(str(item) for item in text if item)
+        elif isinstance(text, dict):
+            # LLM returned a dict for a content field (e.g. {"note": "...", "explanation": "..."})
+            # Extract all non-empty string values and join them into a readable sentence
+            text = " ".join(str(v) for v in text.values() if v)
         elif not isinstance(text, str):
             text = str(text)
         pattern = r'\[SOURCE_(\d+)\]'
@@ -424,17 +428,32 @@ class JSONRenderer:
 
         if "items" in section:
             for item in section["items"]:
-                if isinstance(item, dict):
+                if not isinstance(item, dict):
+                    continue
+                if "indication" in item:
                     indication  = item.get("indication", "")
                     explanation = self._replace_source_tags(item.get("explanation", ""))
                     if indication:
                         lines.append(f"**{indication}**: {explanation}")
                         lines.append("")
-                    elif "consideration" in item:
-                        consideration = item.get("consideration", "")
-                        desc          = self._replace_source_tags(item.get("description", ""))
-                        lines.append(f"**{consideration}**: {desc}")
+                elif "category" in item:
+                    # Size and Risk Thresholds section
+                    category       = item.get("category", "")
+                    threshold      = self._replace_source_tags(item.get("threshold", ""))
+                    recommendation = self._replace_source_tags(item.get("recommendation", ""))
+                    if category:
+                        label = f"**{category}**"
+                        if threshold:
+                            label += f" (threshold: {threshold})"
+                        if recommendation:
+                            label += f": {recommendation}"
+                        lines.append(label)
                         lines.append("")
+                elif "consideration" in item:
+                    consideration = item.get("consideration", "")
+                    desc          = self._replace_source_tags(item.get("description", ""))
+                    lines.append(f"**{consideration}**: {desc}")
+                    lines.append("")
         elif "content" in section:
             lines.append(self._replace_source_tags(section.get("content", "")))
             lines.append("")

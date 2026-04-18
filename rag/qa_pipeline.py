@@ -549,6 +549,11 @@ SYNTHESIS CONTRACT:
 6. Return ONLY valid JSON. No markdown fences, no preamble, no trailing text.
 7. Missing sections that cannot be addressed from ANY excerpt: set content/items to
    null silently. Do NOT explain what is missing.
+8. REFUSAL FIELD: Include "refusal": false as the FIRST key in every JSON response.
+   Change to "refusal": true ONLY when: (a) the question is entirely unrelated to
+   thyroid cancer, OR (b) the retrieved excerpts contain zero relevant information
+   to give any meaningful answer. When refusal is true, set overview and ALL section
+   content/items to null and do not speculate.
 CONTEXT WITH SOURCE TAGS:
 {context}
 """
@@ -1032,6 +1037,42 @@ Return ONLY valid JSON:"""
             question=question, chunks=unique_retrieved, top_k=SECOND_STAGE_TOP_K
         )
 
+        # 5b. Retrieval quality gate — if the best-ranked chunk is well below
+        # relevance threshold the question is almost certainly out-of-scope.
+        # MS-MARCO-MiniLM scores range ~-10 to +10; legitimate thyroid cancer
+        # questions consistently score above -1.5.
+        CROSS_ENCODER_REFUSAL_THRESHOLD = -1.5
+        if reranked_chunks and reranked_chunks[0].get("score", 0) < CROSS_ENCODER_REFUSAL_THRESHOLD:
+            top_score = reranked_chunks[0]["score"]
+            logger.info(
+                f"Retrieval gate: top CE score {top_score:.3f} < {CROSS_ENCODER_REFUSAL_THRESHOLD} "
+                f"— returning structured refusal without LLM call"
+            )
+            _, source_map = self._build_tagged_context(reranked_chunks)
+            return {
+                "json_response": {
+                    "refusal": True,
+                    "overview": (
+                        "The retrieved evidence does not contain sufficient information "
+                        "to answer this question. This system specialises in thyroid cancer "
+                        "clinical management and may not cover the topic you asked about."
+                    ),
+                    "sections": [],
+                },
+                "sources": source_map,
+                "confidence": {"label": "Low", "score": 0, "breakdown": "Insufficient retrieval relevance"},
+                "faithfulness": {"score": None, "label": "Not Available"},
+                "question_type": question_type,
+                "retrieval_stats": {
+                    "first_stage_retrieved": len(all_retrieved),
+                    "after_dedup": len(unique_retrieved),
+                    "after_reranking": len(reranked_chunks),
+                    "refused": True,
+                    "refusal_reason": "cross_encoder_below_threshold",
+                    "top_ce_score": round(top_score, 3),
+                },
+            }
+
         # 6. Context
         context, source_map = self._build_tagged_context(reranked_chunks)
 
@@ -1044,6 +1085,24 @@ Return ONLY valid JSON:"""
                 response = re.sub(r'^```(?:json)?\s*\n?', '', response)
                 response = re.sub(r'\n?```\s*$', '', response)
             json_response = json.loads(response)
+
+            # If LLM set refusal=True, skip all heavy evaluation and return early
+            if json_response.get("refusal", False):
+                logger.info("LLM set refusal=True — returning early without faithfulness/credibility eval")
+                return {
+                    "json_response": json_response,
+                    "sources": source_map,
+                    "confidence": {"label": "Low", "score": 0, "breakdown": "Refused — out of scope or insufficient evidence"},
+                    "faithfulness": {"score": None, "label": "Not Available"},
+                    "question_type": question_type,
+                    "retrieval_stats": {
+                        "first_stage_retrieved": len(all_retrieved),
+                        "after_dedup": len(unique_retrieved),
+                        "after_reranking": len(reranked_chunks),
+                        "refused": True,
+                        "refusal_reason": "llm_refusal",
+                    },
+                }
 
             # 8. Confidence — computed from cited sources only
             cited_keys = set(re.findall(r'SOURCE_\d+', json.dumps(json_response)))
