@@ -1117,5 +1117,5 @@ Return ONLY valid JSON:"""
                 "error": f"Failed to generate structured response: {str(e)}",
                 "json_response": None,
                 "sources": source_map,
-                "confidence": confidence
+                "confidence": self._compute_confidence(reranked_chunks)
             }
